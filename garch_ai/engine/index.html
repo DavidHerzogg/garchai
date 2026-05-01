@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GARCH AI — Backtest</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background: #0d0f14;
+      color: #e2e8f0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 40px 20px;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 40px;
+    }
+
+    header h1 {
+      font-size: 2.2rem;
+      font-weight: 700;
+      background: linear-gradient(135deg, #22d3ee, #818cf8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      letter-spacing: -0.5px;
+    }
+
+    header p {
+      color: #64748b;
+      margin-top: 6px;
+      font-size: 0.9rem;
+    }
+
+    .card {
+      background: #161b27;
+      border: 1px solid #1e2a3a;
+      border-radius: 16px;
+      padding: 28px;
+      width: 100%;
+      max-width: 860px;
+      margin-bottom: 24px;
+    }
+
+    label {
+      display: block;
+      font-size: 0.82rem;
+      font-weight: 600;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 10px;
+    }
+
+    textarea {
+      width: 100%;
+      background: #0d1117;
+      border: 1px solid #1e2a3a;
+      border-radius: 10px;
+      color: #e2e8f0;
+      font-size: 0.95rem;
+      padding: 14px 16px;
+      resize: vertical;
+      min-height: 90px;
+      outline: none;
+      transition: border-color 0.2s;
+      font-family: inherit;
+    }
+
+    textarea:focus { border-color: #22d3ee; }
+
+    button#runBtn {
+      margin-top: 14px;
+      width: 100%;
+      padding: 14px;
+      background: linear-gradient(135deg, #22d3ee, #818cf8);
+      border: none;
+      border-radius: 10px;
+      color: #0d0f14;
+      font-weight: 700;
+      font-size: 1rem;
+      cursor: pointer;
+      transition: opacity 0.2s, transform 0.1s;
+      letter-spacing: 0.02em;
+    }
+
+    button#runBtn:hover  { opacity: 0.9; }
+    button#runBtn:active { transform: scale(0.98); }
+    button#runBtn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    .stats {
+      display: flex;
+      gap: 16px;
+      margin-bottom: 20px;
+      flex-wrap: wrap;
+    }
+
+    .stat {
+      flex: 1;
+      min-width: 120px;
+      background: #0d1117;
+      border: 1px solid #1e2a3a;
+      border-radius: 10px;
+      padding: 14px 18px;
+    }
+
+    .stat-label {
+      font-size: 0.75rem;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .stat-value {
+      font-size: 1.5rem;
+      font-weight: 700;
+      margin-top: 4px;
+      color: #22d3ee;
+    }
+
+    .stat-value.neg { color: #f87171; }
+
+    #chartContainer { position: relative; height: 300px; }
+
+    #status {
+      margin-top: 12px;
+      font-size: 0.85rem;
+      color: #64748b;
+      text-align: center;
+      min-height: 20px;
+    }
+
+    #status.error { color: #f87171; }
+
+    details {
+      margin-top: 16px;
+    }
+
+    summary {
+      cursor: pointer;
+      font-size: 0.82rem;
+      color: #475569;
+      user-select: none;
+    }
+
+    pre {
+      margin-top: 10px;
+      background: #0d1117;
+      border: 1px solid #1e2a3a;
+      border-radius: 8px;
+      padding: 14px;
+      font-size: 0.8rem;
+      color: #94a3b8;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>GARCH AI Backtest</h1>
+  <p>Describe a strategy → AI generates code → Backtest runs → Equity curve renders</p>
+</header>
+
+<!-- Input card -->
+<div class="card">
+  <label for="prompt">Strategy Idea</label>
+  <textarea id="prompt" placeholder="e.g. 20/50 moving average crossover on close price"></textarea>
+  <button id="runBtn" onclick="runBacktest()">▶ Run Backtest</button>
+  <div id="status"></div>
+</div>
+
+<!-- Results card -->
+<div class="card hidden" id="resultsCard">
+  <div class="stats">
+    <div class="stat">
+      <div class="stat-label">Total Return</div>
+      <div class="stat-value" id="statReturn">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Bars</div>
+      <div class="stat-value" id="statBars" style="color:#818cf8">—</div>
+    </div>
+    <div class="stat">
+      <div class="stat-label">Asset</div>
+      <div class="stat-value" style="color:#e2e8f0; font-size:1rem; padding-top:6px">XAUUSD H1 2015</div>
+    </div>
+  </div>
+
+  <div id="chartContainer">
+    <canvas id="equityChart"></canvas>
+  </div>
+
+  <details>
+    <summary>View generated strategy code</summary>
+    <pre id="codeBlock"></pre>
+  </details>
+</div>
+
+<script>
+  const API_URL = "http://localhost:8000";
+  let chart = null;
+
+  async function runBacktest() {
+    const prompt = document.getElementById("prompt").value.trim();
+    if (!prompt) return;
+
+    const btn    = document.getElementById("runBtn");
+    const status = document.getElementById("status");
+    const card   = document.getElementById("resultsCard");
+
+    btn.disabled = true;
+    btn.textContent = "⏳ Running…";
+    status.className = "";
+    status.textContent = "Calling AI model…";
+    card.classList.add("hidden");
+
+    try {
+      const res = await fetch(`${API_URL}/run`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt }),
+      });
+
+      if (!res.ok) {
+        const err = await res.json();
+        throw new Error(err.detail || res.statusText);
+      }
+
+      const data = await res.json();
+      status.textContent = "✅ Backtest complete";
+
+      renderResults(data);
+      card.classList.remove("hidden");
+
+    } catch (e) {
+      status.className = "error";
+      status.textContent = `❌ ${e.message}`;
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "▶ Run Backtest";
+    }
+  }
+
+  function renderResults(data) {
+    // Stats
+    const ret = data.total_return ?? 0;
+    const retEl = document.getElementById("statReturn");
+    retEl.textContent = `${ret >= 0 ? "+" : ""}${ret.toFixed(2)}%`;
+    retEl.className = "stat-value" + (ret < 0 ? " neg" : "");
+    document.getElementById("statBars").textContent = data.num_bars?.toLocaleString() ?? "—";
+
+    // Code
+    document.getElementById("codeBlock").textContent = data.code ?? "";
+
+    // Chart
+    const equity = data.equity ?? [];
+    const labels = data.timestamps ?? equity.map((_, i) => i);
+
+    if (chart) chart.destroy();
+
+    const ctx = document.getElementById("equityChart").getContext("2d");
+    chart = new Chart(ctx, {
+      type: "line",
+      data: {
+        labels,
+        datasets: [{
+          label: "Equity Curve",
+          data: equity,
+          borderColor: "#22d3ee",
+          borderWidth: 2,
+          pointRadius: 0,
+          fill: true,
+          backgroundColor: (ctx) => {
+            const g = ctx.chart.ctx.createLinearGradient(0, 0, 0, 300);
+            g.addColorStop(0, "rgba(34,211,238,0.25)");
+            g.addColorStop(1, "rgba(34,211,238,0)");
+            return g;
+          },
+          tension: 0.3,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: "index", intersect: false },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            backgroundColor: "#161b27",
+            borderColor: "#1e2a3a",
+            borderWidth: 1,
+            callbacks: {
+              label: (c) => ` Equity: ${c.parsed.y.toFixed(4)}`,
+            },
+          },
+        },
+        scales: {
+          x: {
+            ticks: { color: "#475569", maxTicksLimit: 10, maxRotation: 0 },
+            grid:  { color: "#1e2a3a" },
+          },
+          y: {
+            ticks: { color: "#475569" },
+            grid:  { color: "#1e2a3a" },
+          },
+        },
+      },
+    });
+  }
+
+  // Allow Ctrl+Enter to submit
+  document.getElementById("prompt").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) runBacktest();
+  });
+</script>
+</body>
+</html>
