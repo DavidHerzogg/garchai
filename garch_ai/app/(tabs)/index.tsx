@@ -10,6 +10,71 @@ import Animated, { FadeInDown, FadeOut } from 'react-native-reanimated';
 
 const { width } = Dimensions.get('window');
 
+const DEFAULT_ENGINE_URL =
+  Platform.OS === 'android' ? 'http://10.0.2.2:8000' : 'http://localhost:8000';
+const ENGINE_URL = (process.env.EXPO_PUBLIC_ENGINE_URL || DEFAULT_ENGINE_URL).replace(/\/+$/, '');
+
+type GenerateResponse = {
+  code?: unknown;
+};
+
+type BacktestResponse = {
+  equity?: unknown;
+};
+
+async function postEngine<T>(path: string, body: unknown): Promise<T> {
+  const response = await fetch(`${ENGINE_URL}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+
+  const text = await response.text();
+  let payload: any = null;
+
+  if (text) {
+    try {
+      payload = JSON.parse(text);
+    } catch {
+      throw new Error(`Engine returned invalid JSON from ${path}`);
+    }
+  }
+
+  if (!response.ok) {
+    const detail = payload?.detail;
+    const message =
+      typeof detail === 'string'
+        ? detail
+        : payload?.message || response.statusText || 'Engine request failed';
+    throw new Error(message);
+  }
+
+  return payload as T;
+}
+
+function toNumberArray(value: unknown, label: string): number[] {
+  if (!Array.isArray(value)) {
+    throw new Error(`Engine response is missing ${label}`);
+  }
+
+  const numbers = value.map((item) => Number(item));
+  if (numbers.some((item) => !Number.isFinite(item))) {
+    throw new Error(`Engine returned invalid ${label} values`);
+  }
+
+  return numbers;
+}
+
+function downsampleSeries(series: number[], maxPoints = 500): number[] {
+  if (series.length <= maxPoints) return series;
+
+  const lastIndex = series.length - 1;
+  return Array.from({ length: maxPoints }, (_, index) => {
+    const sourceIndex = Math.round((index / (maxPoints - 1)) * lastIndex);
+    return series[sourceIndex];
+  });
+}
+
 // ── Components ──────────────────────────────────────────────────────────────
 
 const MiniChart = ({ data }: { data: number[] }) => {
@@ -48,35 +113,30 @@ export default function StrategyScreen() {
 
   const handleCreate = async () => {
     if (!prompt.trim() || !convexUser) return;
+    const trimmedPrompt = prompt.trim();
     
     setStatus('generating');
     setError('');
 
     try {
-      // 1. Call Python Engine
-      // Use 10.0.2.2 for Android emulator, otherwise localhost
-      const isAndroid = Platform.OS === 'android';
-      const engineUrl = isAndroid ? 'http://10.0.2.2:8000/run' : 'http://localhost:8000/run';
-      
-      const response = await fetch(engineUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt }),
+      const generated = await postEngine<GenerateResponse>('/generate', {
+        prompt: trimmedPrompt,
       });
-
-      if (!response.ok) {
-        const errData = await response.json().catch(() => ({ detail: 'Engine connection failed' }));
-        throw new Error(errData.detail || 'Engine failed');
+      if (typeof generated.code !== 'string' || !generated.code.trim()) {
+        throw new Error('Engine did not return generated code');
       }
-      
+
       setStatus('backtesting');
-      const result = await response.json();
+      const result = await postEngine<BacktestResponse>('/backtest', {
+        code: generated.code,
+      });
+      const equity = toNumberArray(result.equity, 'equity');
 
       // 2. Save to Convex
       await createStrategy({
         userId: convexUser._id,
-        prompt: prompt,
-        equity: result.equity,
+        prompt: trimmedPrompt,
+        equity: downsampleSeries(equity),
       });
 
       setStatus('done');
@@ -209,7 +269,7 @@ const styles = StyleSheet.create({
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-end', marginBottom: 24 },
   headerSubtitle: { fontSize: 12, fontWeight: '600', color: '#22d3ee', textTransform: 'uppercase', letterSpacing: 1 },
   headerTitle: { fontSize: 32, fontWeight: '800', color: '#FFF', marginTop: 2 },
-  iconBtn: { width: 44, height: 44, borderRadius: 12, backgroundColor: '#161b22', justifyContent: 'center', alignItems: 'center', borderWeight: 1, borderColor: '#1e2a3b' },
+  iconBtn: { width: 44, height: 44, borderRadius: 12, backgroundColor: '#161b22', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: '#1e2a3b' },
   mainCreateBtn: { marginBottom: 24, shadowColor: '#22d3ee', shadowOffset: { width: 0, height: 4 }, shadowOpacity: 0.2, shadowRadius: 8 },
   grad: { padding: 18, borderRadius: 16, alignItems: 'center', flexDirection: 'row', justifyContent: 'center' },
   btnText: { color: '#FFF', fontWeight: '800', fontSize: 16, letterSpacing: 0.5 },

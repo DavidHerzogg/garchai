@@ -28,6 +28,8 @@ R2_ACCOUNT_ID   = os.getenv("R2_ACCOUNT_ID", "")
 R2_ACCESS_KEY   = os.getenv("R2_ACCESS_KEY_ID", "")
 R2_SECRET_KEY   = os.getenv("R2_SECRET_ACCESS_KEY", "")
 OPENROUTER_KEY  = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen3-coder:free")
+OPENROUTER_REFERER = os.getenv("OPENROUTER_HTTP_REFERER", "http://localhost:8000")
 
 SYSTEM_PROMPT = """
 You are a quantitative trading code generator.
@@ -46,6 +48,18 @@ Rules:
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def load_parquet_from_r2() -> pd.DataFrame:
+    missing = [
+        name
+        for name, value in {
+            "R2_ACCOUNT_ID": R2_ACCOUNT_ID,
+            "R2_ACCESS_KEY_ID": R2_ACCESS_KEY,
+            "R2_SECRET_ACCESS_KEY": R2_SECRET_KEY,
+        }.items()
+        if not value
+    ]
+    if missing:
+        raise RuntimeError(f"Missing R2 environment variables: {', '.join(missing)}")
+
     s3 = boto3.client(
         "s3",
         endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
@@ -57,15 +71,20 @@ def load_parquet_from_r2() -> pd.DataFrame:
 
 
 async def call_openrouter(user_prompt: str) -> str:
+    if not OPENROUTER_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is not configured")
+
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
             "https://openrouter.ai/api/v1/chat/completions",
             headers={
                 "Authorization": f"Bearer {OPENROUTER_KEY}",
                 "Content-Type": "application/json",
+                "HTTP-Referer": OPENROUTER_REFERER,
+                "X-Title": "GARCH AI",
             },
             json={
-                "model": "qwen/qwen3-coder:free",
+                "model": OPENROUTER_MODEL,
                 "messages": [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user",   "content": user_prompt},
@@ -73,8 +92,19 @@ async def call_openrouter(user_prompt: str) -> str:
                 "temperature": 0,
             },
         )
-        resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text[:500]
+            raise RuntimeError(
+                f"OpenRouter request failed ({exc.response.status_code}): {detail}"
+            ) from exc
+
+        data = resp.json()
+        content = data.get("choices", [{}])[0].get("message", {}).get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise RuntimeError("OpenRouter returned an empty response")
+        return content.strip()
 
 
 def execute_strategy(code: str, df: pd.DataFrame) -> pd.DataFrame:
@@ -96,6 +126,22 @@ def run_backtest(df: pd.DataFrame) -> dict:
     return _bt(df)
 
 
+def backtest_code(code: str) -> dict:
+    df = load_parquet_from_r2()
+    df = execute_strategy(code, df)
+
+    if "signal" not in df.columns:
+        raise ValueError("Strategy did not produce a 'signal' column")
+
+    return run_backtest(df)
+
+
+async def run_prompt(prompt: str) -> dict:
+    code = await call_openrouter(prompt)
+    result = backtest_code(code)
+    return {**result, "code": code}
+
+
 # ── Routes ───────────────────────────────────────────────────────────────────
 
 class GenerateRequest(BaseModel):
@@ -115,19 +161,15 @@ async def generate(req: GenerateRequest):
 @app.post("/backtest")
 async def backtest(req: BacktestRequest):
     try:
-        # Load market data from R2
-        df = load_parquet_from_r2()
+        return backtest_code(req.code)
 
-        # Execute strategy safely
-        df = execute_strategy(req.code, df)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
-        if "signal" not in df.columns:
-            raise ValueError("Strategy did not produce a 'signal' column")
-
-        # Backtest
-        result = run_backtest(df)
-        return result
-
+@app.post("/run")
+async def run(req: GenerateRequest):
+    try:
+        return await run_prompt(req.prompt)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 

@@ -8,7 +8,7 @@ export const list = query({
       .query("strategies")
       .withIndex("by_user", (q) => q.eq("userId", args.userId))
       .order("desc")
-      .collect();
+      .take(50);
   },
 });
 
