@@ -483,17 +483,17 @@
         backtestTimers = [
           setTimeout(() => {
             status.textContent = "Phase 2/2: Daten werden geladen oder Strategie-Code wird getestet...";
-          }, 10000),
+          }, 5000),
           setTimeout(() => {
-            status.textContent = "Phase 2/2: Komplexer Backtest. Vektorisierter Code laeuft optimiert; die Backtest-Phase hat insgesamt bis zu 240 Sekunden.";
-          }, 90000),
+            status.textContent = "Phase 2/2: Backtest laeuft noch. Diese Phase fuehrt keine KI-Reparatur und keine Fallback-Strategie mehr aus.";
+          }, 30000),
         ];
 
         const backtested = await postJson(
           "/backtest",
           { prompt, code: generated.code },
-          240000,
-          "Backtest-Phase hat nach 240 Sekunden abgebrochen. Dann lag es am Datenladen, Strategie-Code oder Backtest."
+          90000,
+          "Backtest-Phase hat nach 90 Sekunden abgebrochen. Dann lag es sehr wahrscheinlich am Datenladen oder Server-Timeout."
         );
         backtestTimers.forEach(clearTimeout);
 
@@ -530,7 +530,7 @@
 
       setText("finalEquityValue", formatMoney(data.final_equity));
       setText("initialCapitalSub", `Startkonto: ${formatMoney(data.initial_capital)} | Risiko: ${formatNumber(data.risk_percent)}%`);
-      setText("barsValue", `${Number(data.num_bars ?? 0).toLocaleString("de-DE")} Kerzen | ${formatNumber(data.years)} Jahre`);
+      setText("barsValue", `${Number(data.num_bars ?? 0).toLocaleString("de-DE")} Kerzen | ${formatNumber(data.years)} Jahre | Chart: ${Number(data.chart_points ?? 0).toLocaleString("de-DE")} Punkte`);
 
       const pf = data.profit_factor ?? (data.winning_trades > 0 && data.losing_trades === 0 ? "∞" : null);
       setText("profitFactorValue", pf === null ? "-" : String(pf));

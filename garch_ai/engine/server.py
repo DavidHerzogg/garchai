@@ -1,5 +1,4 @@
 import ast
-import multiprocessing as mp
 import os
 import io
 import logging
@@ -22,7 +21,6 @@ from dotenv import load_dotenv
 
 ENGINE_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = ENGINE_DIR.parent
-MAX_CODE_ATTEMPTS = 3
 # Load the project env first, then engine/.env with override so a stale shell
 # variable cannot silently win over the local backend configuration.
 load_dotenv(PROJECT_DIR / ".env", override=False)
@@ -79,6 +77,7 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "nvidia/nemotron-3-nano-30b-a3b
 OPENROUTER_REFERER = os.getenv("OPENROUTER_HTTP_REFERER", "http://localhost:8000")
 OPENROUTER_TIMEOUT_SECONDS = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "90"))
 STRATEGY_TIMEOUT_SECONDS = float(os.getenv("STRATEGY_TIMEOUT_SECONDS", "180"))
+MAX_CODE_ATTEMPTS = int(os.getenv("MAX_CODE_ATTEMPTS", "4"))
 R2_CONNECT_TIMEOUT_SECONDS = int(os.getenv("R2_CONNECT_TIMEOUT_SECONDS", "10"))
 R2_READ_TIMEOUT_SECONDS = int(os.getenv("R2_READ_TIMEOUT_SECONDS", "30"))
 MARKET_DATA_CACHE_SECONDS = float(os.getenv("MARKET_DATA_CACHE_SECONDS", "3600"))
@@ -95,12 +94,16 @@ mean reversion, volatility breakout, price/indicator relation strategies, and
 single-asset statistical-arbitrage/latency proxies based on spreads, returns,
 range, volume, rolling z-scores, and lead/lag features.
 Rules:
+- Implement the user's requested strategy directly. Never substitute a generic fallback.
+- If the request needs unavailable data, build the closest possible single-asset
+  proxy from OHLCV while preserving the user's strategy family and entry/exit idea.
 - Add column "signal" with values -1, 0, 1.
 - df is already chronological; do not sort by timestamp.
 - Do not assume unavailable columns or other assets exist.
 - If you use timestamp, use it only for hour/session filters, never as a required sort key.
 - Use only provided pd and np variables; do not write import statements.
 - Use vectorized pandas/numpy logic, no row loops, no network/file access, no while loops.
+- Do not use pandas apply/map/iterrows/itertuples or expensive custom Python callbacks.
 - Use ONLY past/current data: rolling(...).mean(), shift(1), expanding, etc.; no lookahead.
 - Always fill signal NaNs with 0 and cast to int before returning.
 - Return the modified df.
@@ -125,9 +128,11 @@ The code must define:
 Guaranteed columns: timestamp, open, high, low, close, volume, returns, log_return,
 bar_range, body, hl2, ohlc4.
 Rules:
+- Preserve the user's requested strategy logic. Do not replace it with a generic fallback.
 - Do not sort by timestamp; data is already chronological.
 - Do not use columns that are not guaranteed.
 - No imports, no file/network access, no while loops, no row loops.
+- No pandas apply/map/iterrows/itertuples or custom Python callbacks.
 - Use pd and np only.
 - Add signal with -1, 0, 1, fill NaNs with 0, cast to int, return df.
 """
@@ -281,6 +286,12 @@ def normalize_market_data(raw_df: pd.DataFrame) -> pd.DataFrame:
             index=range(length),
         )
     normalized["timestamp"] = parsed_timestamp.dt.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        normalized["_timestamp_ns"] = parsed_timestamp.astype("int64")
+    except Exception:
+        normalized["_timestamp_ns"] = pd.to_datetime(
+            normalized["timestamp"], errors="coerce", utc=True
+        ).astype("int64")
 
     # Helper columns improve robustness for relation, momentum, ORB, mean reversion,
     # and single-asset stat-arb style prompts without requiring extra datasets.
@@ -295,6 +306,23 @@ def normalize_market_data(raw_df: pd.DataFrame) -> pd.DataFrame:
         (normalized["open"] + normalized["high"] + normalized["low"] + normalized["close"]) / 4
     ).fillna(normalized["close"])
 
+    for column in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "returns",
+        "log_return",
+        "bar_range",
+        "body",
+        "hl2",
+        "ohlc4",
+    ]:
+        normalized[column] = pd.to_numeric(
+            normalized[column], errors="coerce", downcast="float"
+        )
+
     normalized = normalized.ffill().bfill().reset_index(drop=True)
     return normalized
 
@@ -308,7 +336,7 @@ def ensure_market_data(df: pd.DataFrame) -> pd.DataFrame:
     return normalize_market_data(df)
 
 
-def get_market_data(refresh: bool = False) -> tuple[pd.DataFrame, bool, float]:
+def get_market_data(refresh: bool = False, copy: bool = False) -> tuple[pd.DataFrame, bool, float]:
     started = time.perf_counter()
     now = time.time()
     cached_df = MARKET_DATA_CACHE.get("df")
@@ -319,12 +347,14 @@ def get_market_data(refresh: bool = False) -> tuple[pd.DataFrame, bool, float]:
         and isinstance(cached_df, pd.DataFrame)
         and now - loaded_at < MARKET_DATA_CACHE_SECONDS
     ):
-        return cached_df.copy(), True, time.perf_counter() - started
+        output = cached_df.copy(deep=False) if copy else cached_df
+        return output, True, time.perf_counter() - started
 
     df = normalize_market_data(load_parquet_from_r2())
     MARKET_DATA_CACHE["df"] = df
     MARKET_DATA_CACHE["loaded_at"] = now
-    return df.copy(), False, time.perf_counter() - started
+    output = df.copy(deep=False) if copy else df
+    return output, False, time.perf_counter() - started
 
 
 async def call_openrouter_completion(messages: list[dict], temperature: float = 0) -> str:
@@ -391,7 +421,7 @@ async def call_openrouter(user_prompt: str) -> str:
     )
 
 
-def fallback_strategy_summary(prompt: str, code: str) -> str:
+def heuristic_strategy_summary(prompt: str, code: str) -> str:
     has_stop = bool(re.search(r"\b(stop|stop_loss|sl)\b", code, re.IGNORECASE))
     has_take_profit = bool(re.search(r"\b(take_profit|tp|target)\b", code, re.IGNORECASE))
 
@@ -427,7 +457,7 @@ async def summarize_strategy(prompt: str, code: str) -> str:
         )
     except Exception as exc:
         logger.warning("Strategy summary generation failed: %s", exc)
-        return fallback_strategy_summary(prompt, code)
+        return heuristic_strategy_summary(prompt, code)
 
 
 async def repair_strategy_code(prompt: str, code: str, error: str) -> str:
@@ -448,7 +478,8 @@ async def repair_strategy_code(prompt: str, code: str, error: str) -> str:
     )
 
 
-def fallback_strategy_code(prompt: str) -> str:
+def disabled_legacy_strategy_template(prompt: str) -> str:
+    raise RuntimeError("Legacy strategy templates are disabled; repair AI code instead.")
     prompt_lower = prompt.lower()
 
     if any(word in prompt_lower for word in ["orb", "opening range", "breakout", "ausbruch"]):
@@ -584,9 +615,17 @@ DISALLOWED_CALLS = {
     "input",
 }
 DISALLOWED_ATTRS = {
+    "apply",
+    "applymap",
+    "iterrows",
+    "itertuples",
+    "map",
+    "pipe",
     "read_csv",
     "read_excel",
     "read_parquet",
+    "sort_index",
+    "sort_values",
     "to_csv",
     "to_excel",
     "to_pickle",
@@ -676,17 +715,98 @@ def execute_strategy(code: str, df: pd.DataFrame) -> pd.DataFrame:
     if "signal" not in result.columns:
         raise ValueError("Strategy did not produce a 'signal' column")
 
-    signals = pd.Series(result["signal"], index=df.index)
+    signals = pd.to_numeric(result["signal"], errors="coerce")
     if len(signals) != len(df):
         raise ValueError("Generated signal length does not match market data length")
+    signals = pd.Series(signals.to_numpy(), index=df.index).replace([np.inf, -np.inf], np.nan)
+    signals = signals.fillna(0).clip(-1, 1).astype(int)
 
-    output = df.copy()
+    output = df.copy(deep=False)
     output["signal"] = signals
     return output
 
 
+def make_smoke_test_data(rows: int = 320) -> pd.DataFrame:
+    index = np.arange(rows, dtype=float)
+    close = 100 + np.sin(index / 9) * 2 + index * 0.03
+    open_ = close + np.sin(index / 5) * 0.15
+    high = np.maximum(open_, close) + 0.35
+    low = np.minimum(open_, close) - 0.35
+    volume = 1000 + (np.cos(index / 11) * 100)
+    df = pd.DataFrame(
+        {
+            "timestamp": pd.date_range("2020-01-01", periods=rows, freq="h", tz="UTC").strftime(
+                "%Y-%m-%d %H:%M:%S"
+            ),
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+        }
+    )
+    df["_timestamp_ns"] = pd.date_range("2020-01-01", periods=rows, freq="h", tz="UTC").astype(
+        "int64"
+    )
+    df["returns"] = df["close"].pct_change().fillna(0)
+    df["log_return"] = np.log(df["close"] / df["close"].shift(1)).replace(
+        [np.inf, -np.inf], np.nan
+    ).fillna(0)
+    df["bar_range"] = (df["high"] - df["low"]).fillna(0)
+    df["body"] = (df["close"] - df["open"]).fillna(0)
+    df["hl2"] = ((df["high"] + df["low"]) / 2).fillna(df["close"])
+    df["ohlc4"] = ((df["open"] + df["high"] + df["low"] + df["close"]) / 4).fillna(df["close"])
+    return df
+
+
+def smoke_test_strategy_code(code: str) -> str:
+    compiled = compile_generated_code(code)
+    smoke_df = make_smoke_test_data()
+    started = time.perf_counter()
+    result = execute_strategy(compiled, smoke_df)
+    elapsed = time.perf_counter() - started
+    if elapsed > 2.0:
+        raise TimeoutError(
+            f"Generated strategy is too slow on smoke data ({elapsed:.2f}s)."
+        )
+
+    signals = pd.to_numeric(result["signal"], errors="coerce").fillna(0)
+    if len(signals) != len(smoke_df):
+        raise ValueError("Generated signal length changed during smoke test")
+    if not set(signals.astype(int).unique()).issubset({-1, 0, 1}):
+        raise ValueError("Generated signal contains values outside -1, 0, 1")
+    return compiled
+
+
+async def prepare_strategy_code(prompt: str, code: str) -> tuple[str, list[str]]:
+    errors: list[str] = []
+    current_code = code
+
+    for attempt in range(max(1, MAX_CODE_ATTEMPTS)):
+        try:
+            return smoke_test_strategy_code(current_code), errors
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            errors.append(error)
+            logger.warning("Strategy validation attempt %s failed: %s", attempt + 1, error)
+
+            if attempt + 1 >= MAX_CODE_ATTEMPTS:
+                break
+
+            current_code = await repair_strategy_code(prompt, current_code, "\n\n".join(errors))
+
+    detail = "; ".join(errors[-3:])
+    raise ValueError(
+        "AI strategy code could not be made executable without changing the requested "
+        f"strategy into a fallback. No fallback was used. Last errors: {detail}"
+    )
+
+
 def run_backtest(df: pd.DataFrame) -> dict:
-    from backtest import run_backtest as _bt
+    try:
+        from backtest import run_backtest as _bt
+    except ModuleNotFoundError:
+        from engine.backtest import run_backtest as _bt
     return _bt(df)
 
 
@@ -700,73 +820,43 @@ def backtest_code(code: str, market_df: pd.DataFrame | None = None) -> dict:
     return run_backtest(df)
 
 
-async def backtest_with_repair(prompt: str, code: str, market_df: pd.DataFrame) -> dict:
-    errors: list[str] = []
-
-    for attempt in range(max(1, MAX_CODE_ATTEMPTS)):
-        try:
-            result = backtest_code(code, market_df)
-            summary = fallback_strategy_summary(prompt, code)
-            if errors:
-                summary += (
-                    "\n\nHinweis: Der erste KI-Code musste automatisch repariert "
-                    "oder durch eine robuste Fallback-Strategie ersetzt werden."
-                )
-            return {**result, "code": code, "summary": summary, "attempts": attempt + 1}
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-            errors.append(error)
-            logger.warning("Generated strategy attempt %s failed: %s", attempt + 1, error.splitlines()[0])
-
-            if attempt + 1 >= MAX_CODE_ATTEMPTS:
-                break
-
-            try:
-                code = await repair_strategy_code(prompt, code, "\n\n".join(errors))
-            except Exception as repair_exc:
-                errors.append(f"Repair failed: {type(repair_exc).__name__}: {repair_exc}")
-                break
-
-    code = fallback_strategy_code(prompt)
-    result = backtest_code(code, market_df)
-    summary = fallback_strategy_summary(prompt, code)
-    summary += (
-        "\n\nHinweis: Der KI-Code war nicht lauffaehig. "
-        "Der Server hat deshalb eine robuste Fallback-Strategie passend zum Prompt genutzt."
-    )
+def backtest_prepared_code(prompt: str, code: str, market_df: pd.DataFrame) -> dict:
+    compiled = smoke_test_strategy_code(code)
+    started = time.perf_counter()
+    result = backtest_code(compiled, market_df)
+    strategy_seconds = time.perf_counter() - started
+    summary = heuristic_strategy_summary(prompt, compiled)
     return {
         **result,
-        "code": code,
+        "code": compiled,
         "summary": summary,
-        "attempts": len(errors) + 1,
-        "warnings": errors[-3:],
+        "attempts": 1,
+        "strategy_seconds": round(strategy_seconds, 3),
     }
 
 
 async def generate_strategy(prompt: str) -> dict:
     started = time.perf_counter()
-    code = await call_openrouter(prompt)
+    raw_code = await call_openrouter(prompt)
+    code, repair_errors = await prepare_strategy_code(prompt, raw_code)
+    timings = {"api_seconds": round(time.perf_counter() - started, 3)}
+    if repair_errors:
+        timings["repair_attempts"] = len(repair_errors)
     return {
         "code": code,
         "model": OPENROUTER_MODEL,
-        "timings": {"api_seconds": round(time.perf_counter() - started, 3)},
+        "timings": timings,
     }
 
 
 async def run_prompt(prompt: str) -> dict:
     total_started = time.perf_counter()
-    api_started = time.perf_counter()
-    try:
-        code = await call_openrouter(prompt)
-        api_error = None
-    except Exception as exc:
-        code = fallback_strategy_code(prompt)
-        api_error = f"{type(exc).__name__}: {exc}"
-    api_seconds = time.perf_counter() - api_started
+    generated = await generate_strategy(prompt)
+    api_seconds = generated["timings"]["api_seconds"]
 
     market_df, cache_hit, data_seconds = get_market_data()
     backtest_started = time.perf_counter()
-    result = await backtest_with_repair(prompt, code, market_df)
+    result = backtest_prepared_code(prompt, generated["code"], market_df)
     backtest_seconds = time.perf_counter() - backtest_started
 
     timings = {
@@ -776,8 +866,8 @@ async def run_prompt(prompt: str) -> dict:
         "total_seconds": round(time.perf_counter() - total_started, 3),
         "data_cache_hit": cache_hit,
     }
-    if api_error:
-        timings["api_error"] = api_error
+    if "repair_attempts" in generated["timings"]:
+        timings["repair_attempts"] = generated["timings"]["repair_attempts"]
     return {**result, "timings": timings}
 
 
@@ -794,7 +884,11 @@ class BacktestRequest(BaseModel):
 async def generate(req: GenerateRequest):
     try:
         return await generate_strategy(req.prompt)
+    except ValueError as e:
+        logger.exception("Strategy generation/validation failed")
+        raise HTTPException(status_code=422, detail=f"{type(e).__name__}: {e}")
     except Exception as e:
+        logger.exception("Strategy generation failed")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 @app.post("/backtest")
@@ -803,23 +897,32 @@ async def backtest(req: BacktestRequest):
         total_started = time.perf_counter()
         market_df, cache_hit, data_seconds = get_market_data()
         backtest_started = time.perf_counter()
-        result = await backtest_with_repair(req.prompt, req.code, market_df)
+        result = backtest_prepared_code(req.prompt, req.code, market_df)
         result["timings"] = {
             "data_seconds": round(data_seconds, 3),
             "backtest_seconds": round(time.perf_counter() - backtest_started, 3),
+            "strategy_seconds": result.get("strategy_seconds"),
             "total_seconds": round(time.perf_counter() - total_started, 3),
             "data_cache_hit": cache_hit,
         }
         return result
 
+    except ValueError as e:
+        logger.exception("Backtest rejected invalid strategy code")
+        raise HTTPException(status_code=422, detail=f"{type(e).__name__}: {e}")
     except Exception as e:
+        logger.exception("Backtest failed")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
 @app.post("/run")
 async def run(req: GenerateRequest):
     try:
         return await run_prompt(req.prompt)
+    except ValueError as e:
+        logger.exception("Run rejected invalid strategy code")
+        raise HTTPException(status_code=422, detail=f"{type(e).__name__}: {e}")
     except Exception as e:
+        logger.exception("Run failed")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
 
 @app.get("/", response_class=HTMLResponse)
