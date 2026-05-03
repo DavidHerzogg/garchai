@@ -1,58 +1,58 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="de">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>GARCH AI — Backtest</title>
+  <title>GARCH AI - Backtest</title>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     body {
-      font-family: 'Inter', system-ui, sans-serif;
+      font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       background: #0d0f14;
       color: #e2e8f0;
       min-height: 100vh;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      padding: 40px 20px;
+      padding: 36px 18px 56px;
+    }
+
+    main, header {
+      width: 100%;
+      max-width: 1120px;
+      margin: 0 auto;
     }
 
     header {
-      text-align: center;
-      margin-bottom: 40px;
+      margin-bottom: 28px;
     }
 
     header h1 {
-      font-size: 2.2rem;
-      font-weight: 700;
-      background: linear-gradient(135deg, #22d3ee, #818cf8);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      letter-spacing: -0.5px;
+      font-size: clamp(2rem, 4vw, 3.1rem);
+      font-weight: 800;
+      color: #f8fafc;
+      letter-spacing: 0;
     }
 
     header p {
-      color: #64748b;
-      margin-top: 6px;
-      font-size: 0.9rem;
+      color: #94a3b8;
+      margin-top: 8px;
+      font-size: 0.98rem;
+      line-height: 1.5;
     }
 
     .card {
       background: #161b27;
       border: 1px solid #1e2a3a;
-      border-radius: 16px;
-      padding: 28px;
+      border-radius: 12px;
+      padding: 24px;
       width: 100%;
-      max-width: 860px;
-      margin-bottom: 24px;
+      margin-bottom: 22px;
     }
 
     label {
       display: block;
-      font-size: 0.82rem;
-      font-weight: 600;
+      font-size: 0.78rem;
+      font-weight: 750;
       color: #94a3b8;
       text-transform: uppercase;
       letter-spacing: 0.08em;
@@ -65,13 +65,14 @@
       border: 1px solid #1e2a3a;
       border-radius: 10px;
       color: #e2e8f0;
-      font-size: 0.95rem;
-      padding: 14px 16px;
+      font-size: 1rem;
+      padding: 15px 16px;
       resize: vertical;
-      min-height: 90px;
+      min-height: 96px;
       outline: none;
       transition: border-color 0.2s;
       font-family: inherit;
+      line-height: 1.45;
     }
 
     textarea:focus { border-color: #22d3ee; }
@@ -79,251 +80,605 @@
     button#runBtn {
       margin-top: 14px;
       width: 100%;
-      padding: 14px;
+      padding: 15px 18px;
       background: linear-gradient(135deg, #22d3ee, #818cf8);
       border: none;
       border-radius: 10px;
       color: #0d0f14;
-      font-weight: 700;
+      font-weight: 800;
       font-size: 1rem;
       cursor: pointer;
       transition: opacity 0.2s, transform 0.1s;
-      letter-spacing: 0.02em;
+      letter-spacing: 0;
     }
 
-    button#runBtn:hover  { opacity: 0.9; }
-    button#runBtn:active { transform: scale(0.98); }
-    button#runBtn:disabled { opacity: 0.5; cursor: not-allowed; }
-
-    .stats {
-      display: flex;
-      gap: 16px;
-      margin-bottom: 20px;
-      flex-wrap: wrap;
-    }
-
-    .stat {
-      flex: 1;
-      min-width: 120px;
-      background: #0d1117;
-      border: 1px solid #1e2a3a;
-      border-radius: 10px;
-      padding: 14px 18px;
-    }
-
-    .stat-label {
-      font-size: 0.75rem;
-      color: #64748b;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-    }
-
-    .stat-value {
-      font-size: 1.5rem;
-      font-weight: 700;
-      margin-top: 4px;
-      color: #22d3ee;
-    }
-
-    .stat-value.neg { color: #f87171; }
-
-    #chartContainer { position: relative; height: 300px; }
+    button#runBtn:hover { opacity: 0.92; }
+    button#runBtn:active { transform: scale(0.99); }
+    button#runBtn:disabled { opacity: 0.55; cursor: not-allowed; }
 
     #status {
       margin-top: 12px;
-      font-size: 0.85rem;
-      color: #64748b;
+      font-size: 0.9rem;
+      color: #94a3b8;
       text-align: center;
-      min-height: 20px;
+      min-height: 22px;
+      line-height: 1.4;
     }
 
     #status.error { color: #f87171; }
+    #status.ok { color: #4ade80; }
+
+    .section-title {
+      font-size: 0.86rem;
+      font-weight: 800;
+      color: #f8fafc;
+      margin-bottom: 14px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 22px;
+    }
+
+    .metric {
+      background: #0d1117;
+      border: 1px solid #1e2a3a;
+      border-radius: 10px;
+      padding: 15px;
+      min-height: 100px;
+    }
+
+    .metric.primary {
+      border-color: rgba(34, 211, 238, 0.35);
+      background: linear-gradient(180deg, rgba(34, 211, 238, 0.08), #0d1117 58%);
+    }
+
+    .metric-label {
+      font-size: 0.72rem;
+      color: #64748b;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-weight: 800;
+      margin-bottom: 8px;
+    }
+
+    .metric-value {
+      font-size: 1.35rem;
+      line-height: 1.15;
+      font-weight: 850;
+      color: #22d3ee;
+      word-break: break-word;
+    }
+
+    .metric-value.small { font-size: 1.05rem; }
+    .metric-value.neutral { color: #e2e8f0; }
+    .metric-value.neg { color: #f87171; }
+    .metric-value.good { color: #4ade80; }
+
+    .metric-sub {
+      color: #94a3b8;
+      font-size: 0.82rem;
+      line-height: 1.35;
+      margin-top: 8px;
+    }
+
+    .summary {
+      background: #0d1117;
+      border: 1px solid #1e2a3a;
+      border-radius: 10px;
+      padding: 18px;
+      margin-bottom: 22px;
+    }
+
+    .summary p {
+      color: #cbd5e1;
+      line-height: 1.65;
+      font-size: 0.95rem;
+      white-space: pre-wrap;
+    }
+
+    #chartContainer {
+      position: relative;
+      height: 360px;
+      margin-bottom: 10px;
+    }
+
+    .details-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+      margin-top: 18px;
+    }
 
     details {
-      margin-top: 16px;
+      background: #0d1117;
+      border: 1px solid #1e2a3a;
+      border-radius: 10px;
+      padding: 14px;
     }
 
     summary {
       cursor: pointer;
-      font-size: 0.82rem;
-      color: #475569;
+      font-size: 0.86rem;
+      color: #94a3b8;
       user-select: none;
+      font-weight: 700;
     }
 
     pre {
-      margin-top: 10px;
-      background: #0d1117;
+      margin-top: 12px;
+      background: #070a0f;
       border: 1px solid #1e2a3a;
       border-radius: 8px;
       padding: 14px;
-      font-size: 0.8rem;
-      color: #94a3b8;
+      font-size: 0.82rem;
+      color: #cbd5e1;
       overflow-x: auto;
       white-space: pre-wrap;
       word-break: break-word;
+      line-height: 1.5;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+      font-size: 0.82rem;
+      color: #cbd5e1;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 9px 6px;
+      border-bottom: 1px solid #1e2a3a;
+      vertical-align: top;
+    }
+
+    th {
+      color: #64748b;
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
     }
 
     .hidden { display: none; }
+
+    @media (max-width: 920px) {
+      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .details-grid { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 560px) {
+      body { padding: 24px 12px 40px; }
+      .card { padding: 18px; }
+      .metrics { grid-template-columns: 1fr; }
+      #chartContainer { height: 300px; }
+    }
   </style>
 </head>
 <body>
+  <header>
+    <h1>GARCH AI Backtest</h1>
+    <p>Beschreibe eine Strategie. Die KI generiert Signal-Code, der Server testet ihn auf XAUUSD H1 und zeigt Konto-Equity, Metriken und Strategie-Logik.</p>
+  </header>
 
-<header>
-  <h1>GARCH AI Backtest</h1>
-  <p>Describe a strategy → AI generates code → Backtest runs → Equity curve renders</p>
-</header>
-
-<!-- Input card -->
-<div class="card">
-  <label for="prompt">Strategy Idea</label>
-  <textarea id="prompt" placeholder="e.g. 20/50 moving average crossover on close price"></textarea>
-  <button id="runBtn" onclick="runBacktest()">▶ Run Backtest</button>
-  <div id="status"></div>
-</div>
-
-<!-- Results card -->
-<div class="card hidden" id="resultsCard">
-  <div class="stats">
-    <div class="stat">
-      <div class="stat-label">Total Return</div>
-      <div class="stat-value" id="statReturn">—</div>
+  <main>
+    <div class="card">
+      <label for="prompt">Strategie-Idee</label>
+      <textarea id="prompt" placeholder="z.B. Long wenn RSI unter 30 war und der Kurs wieder ueber den EMA 50 steigt; Exit wenn RSI ueber 65 oder Kurs unter EMA 50 faellt."></textarea>
+      <button id="runBtn" onclick="runBacktest()">Backtest starten</button>
+      <div id="status"></div>
     </div>
-    <div class="stat">
-      <div class="stat-label">Bars</div>
-      <div class="stat-value" id="statBars" style="color:#818cf8">—</div>
+
+    <div class="card hidden" id="resultsCard">
+      <div class="section-title">Konto & Rendite</div>
+      <div class="metrics">
+        <div class="metric primary">
+          <div class="metric-label">Net Return</div>
+          <div class="metric-value" id="netReturnValue">-</div>
+          <div class="metric-sub" id="netReturnSub">-</div>
+        </div>
+        <div class="metric primary">
+          <div class="metric-label">Annual Net Return</div>
+          <div class="metric-value" id="annualReturnValue">-</div>
+          <div class="metric-sub" id="annualReturnSub">-</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Final Equity</div>
+          <div class="metric-value neutral" id="finalEquityValue">-</div>
+          <div class="metric-sub" id="initialCapitalSub">Startkonto: -</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Asset / Daten</div>
+          <div class="metric-value small neutral">XAUUSD H1</div>
+          <div class="metric-sub" id="barsValue">-</div>
+        </div>
+      </div>
+
+      <div class="section-title">Performance-Metriken</div>
+      <div class="metrics">
+        <div class="metric">
+          <div class="metric-label">Profitfaktor</div>
+          <div class="metric-value" id="profitFactorValue">-</div>
+          <div class="metric-sub" id="profitFactorSub">-</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Winrate</div>
+          <div class="metric-value" id="winRateValue">-</div>
+          <div class="metric-sub" id="winRateSub">-</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Trades Gesamt</div>
+          <div class="metric-value neutral" id="tradesValue">-</div>
+          <div class="metric-sub" id="tradesSub">-</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Sharpe Ratio</div>
+          <div class="metric-value" id="sharpeValue">-</div>
+          <div class="metric-sub" id="sortinoSub">-</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Max. Drawdown</div>
+          <div class="metric-value neg" id="maxDrawdownValue">-</div>
+          <div class="metric-sub" id="maxDrawdownSub">-</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Rel. Drawdown</div>
+          <div class="metric-value neg" id="relDrawdownValue">-</div>
+          <div class="metric-sub">bezogen auf 10k Startkonto</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Exposure</div>
+          <div class="metric-value neutral" id="exposureValue">-</div>
+          <div class="metric-sub" id="volatilitySub">-</div>
+        </div>
+        <div class="metric">
+          <div class="metric-label">Buy & Hold</div>
+          <div class="metric-value neutral" id="buyHoldValue">-</div>
+          <div class="metric-sub" id="avgTradeSub">-</div>
+        </div>
+      </div>
+
+      <div class="section-title">Strategie-Zusammenfassung</div>
+      <div class="summary">
+        <p id="summaryText">-</p>
+      </div>
+
+      <div class="section-title">Equity Curve</div>
+      <div id="chartContainer">
+        <canvas id="equityChart"></canvas>
+      </div>
+
+      <div class="details-grid">
+        <details open>
+          <summary>Letzte Trades</summary>
+          <table>
+            <thead>
+              <tr>
+                <th>Richtung</th>
+                <th>Entry</th>
+                <th>Exit</th>
+                <th>PnL</th>
+              </tr>
+            </thead>
+            <tbody id="tradesBody"></tbody>
+          </table>
+        </details>
+        <details>
+          <summary>Generierter Strategie-Code</summary>
+          <pre id="codeBlock"></pre>
+        </details>
+      </div>
     </div>
-    <div class="stat">
-      <div class="stat-label">Asset</div>
-      <div class="stat-value" style="color:#e2e8f0; font-size:1rem; padding-top:6px">XAUUSD H1 2015</div>
-    </div>
-  </div>
+  </main>
 
-  <div id="chartContainer">
-    <canvas id="equityChart"></canvas>
-  </div>
+  <script>
+    const API_URL = window.location.origin;
+    let chart = null;
 
-  <details>
-    <summary>View generated strategy code</summary>
-    <pre id="codeBlock"></pre>
-  </details>
-</div>
-
-<script>
-  const API_URL = "http://localhost:8000";
-  let chart = null;
-
-  async function runBacktest() {
-    const prompt = document.getElementById("prompt").value.trim();
-    if (!prompt) return;
-
-    const btn    = document.getElementById("runBtn");
-    const status = document.getElementById("status");
-    const card   = document.getElementById("resultsCard");
-
-    btn.disabled = true;
-    btn.textContent = "⏳ Running…";
-    status.className = "";
-    status.textContent = "Calling AI model…";
-    card.classList.add("hidden");
-
-    try {
-      const res = await fetch(`${API_URL}/run`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
+    function formatNumber(value, digits = 2) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
+      return Number(value).toLocaleString("de-DE", {
+        minimumFractionDigits: digits,
+        maximumFractionDigits: digits,
       });
+    }
 
-      if (!res.ok) {
-        const err = await res.json();
-        throw new Error(err.detail || res.statusText);
+    function formatPct(value, digits = 2) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
+      const sign = Number(value) > 0 ? "+" : "";
+      return `${sign}${formatNumber(value, digits)}%`;
+    }
+
+    function formatMoney(value, currency = "USD") {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
+      return Number(value).toLocaleString("de-DE", {
+        style: "currency",
+        currency,
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+      });
+    }
+
+    function setMetric(id, value, negativeWhenBelowZero = true) {
+      const el = document.getElementById(id);
+      el.textContent = value;
+      el.classList.toggle("neg", negativeWhenBelowZero && String(value).trim().startsWith("-"));
+      el.classList.toggle("good", negativeWhenBelowZero && String(value).trim().startsWith("+"));
+    }
+
+    function setText(id, value) {
+      document.getElementById(id).textContent = value ?? "-";
+    }
+
+    function shortError(message) {
+      return String(message || "Unbekannter Fehler").split("\n")[0].slice(0, 700);
+    }
+
+    async function postJson(path, body, timeoutMs, timeoutMessage) {
+      const controller = new AbortController();
+      const requestTimeout = setTimeout(() => controller.abort(), timeoutMs);
+
+      try {
+        const res = await fetch(`${API_URL}${path}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        });
+
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(shortError(err.detail || res.statusText));
+        }
+
+        return await res.json();
+      } catch (e) {
+        if (e.name === "AbortError") throw new Error(timeoutMessage);
+        throw e;
+      } finally {
+        clearTimeout(requestTimeout);
+      }
+    }
+
+    async function runBacktest() {
+      const prompt = document.getElementById("prompt").value.trim();
+      if (!prompt) return;
+
+      const btn = document.getElementById("runBtn");
+      const status = document.getElementById("status");
+      const card = document.getElementById("resultsCard");
+
+      btn.disabled = true;
+      btn.textContent = "Backtest laeuft...";
+      status.className = "";
+      status.textContent = "Phase 1/2: KI/API generiert Strategie-Code...";
+      card.classList.add("hidden");
+
+      const statusTimers = [
+        setTimeout(() => {
+          status.textContent = "Phase 1/2: OpenRouter braucht gerade etwas laenger...";
+        }, 15000),
+        setTimeout(() => {
+          status.textContent = "Phase 1/2: KI/API laeuft noch. Wenn diese Phase abbricht, lag es an der API-Antwort.";
+        }, 60000),
+      ];
+      let backtestTimers = [];
+
+      try {
+        const generated = await postJson(
+          "/generate",
+          { prompt },
+          120000,
+          "KI/API-Phase hat nach 120 Sekunden abgebrochen."
+        );
+
+        statusTimers.forEach(clearTimeout);
+        status.textContent = `Phase 2/2: Backtest startet. KI/API fertig in ${formatNumber(generated.timings?.api_seconds ?? 0, 1)}s.`;
+
+        backtestTimers = [
+          setTimeout(() => {
+            status.textContent = "Phase 2/2: Daten werden geladen oder Strategie-Code wird getestet...";
+          }, 10000),
+          setTimeout(() => {
+            status.textContent = "Phase 2/2: Komplexer Backtest. Vektorisierter Code laeuft optimiert; die Backtest-Phase hat insgesamt bis zu 240 Sekunden.";
+          }, 90000),
+        ];
+
+        const backtested = await postJson(
+          "/backtest",
+          { prompt, code: generated.code },
+          240000,
+          "Backtest-Phase hat nach 240 Sekunden abgebrochen. Dann lag es am Datenladen, Strategie-Code oder Backtest."
+        );
+        backtestTimers.forEach(clearTimeout);
+
+        const data = {
+          ...backtested,
+          code: backtested.code || generated.code,
+          timings: {
+            ...(backtested.timings || {}),
+            ...(generated.timings || {}),
+          },
+        };
+        status.className = "ok";
+        status.textContent = `Backtest abgeschlossen. KI/API: ${formatNumber(data.timings.api_seconds ?? 0, 1)}s, Backtest: ${formatNumber(data.timings.backtest_seconds ?? 0, 1)}s, Daten: ${formatNumber(data.timings.data_seconds ?? 0, 1)}s.`;
+        renderResults(data);
+        card.classList.remove("hidden");
+      } catch (e) {
+        status.className = "error";
+        status.textContent = `Fehler: ${shortError(e.message)}`;
+      } finally {
+        statusTimers.forEach(clearTimeout);
+        backtestTimers.forEach(clearTimeout);
+        btn.disabled = false;
+        btn.textContent = "Backtest starten";
+      }
+    }
+
+    function renderResults(data) {
+      const netPct = data.total_return_pct ?? data.total_return ?? 0;
+      setMetric("netReturnValue", `${formatPct(netPct)} / ${formatMoney(data.total_return_amount)}`);
+      setText("netReturnSub", `1% Risiko: ${formatMoney(data.total_return_amount_at_1pct, "EUR")}`);
+
+      setMetric("annualReturnValue", `${formatPct(data.annual_return_pct)} p.a.`);
+      setText("annualReturnSub", `${formatMoney(data.annual_return_amount)} p.a. | 1% Risiko: ${formatMoney(data.annual_return_amount_at_1pct, "EUR")}`);
+
+      setText("finalEquityValue", formatMoney(data.final_equity));
+      setText("initialCapitalSub", `Startkonto: ${formatMoney(data.initial_capital)} | Risiko: ${formatNumber(data.risk_percent)}%`);
+      setText("barsValue", `${Number(data.num_bars ?? 0).toLocaleString("de-DE")} Kerzen | ${formatNumber(data.years)} Jahre`);
+
+      const pf = data.profit_factor ?? (data.winning_trades > 0 && data.losing_trades === 0 ? "∞" : null);
+      setText("profitFactorValue", pf === null ? "-" : String(pf));
+      setText("profitFactorSub", `Ø Trade: ${formatPct(data.average_trade)} | Bester: ${formatPct(data.best_trade)} | Schlechtester: ${formatPct(data.worst_trade)}`);
+
+      setText("winRateValue", formatPct(data.win_rate));
+      setText("winRateSub", `${data.winning_trades ?? 0} Gewinner / ${data.losing_trades ?? 0} Verlierer`);
+
+      setText("tradesValue", Number(data.trades_total ?? 0).toLocaleString("de-DE"));
+      setText("tradesSub", `${data.long_trades ?? 0} Long / ${data.short_trades ?? 0} Short`);
+
+      setText("sharpeValue", formatNumber(data.sharpe_ratio));
+      setText("sortinoSub", `Sortino: ${formatNumber(data.sortino_ratio)}`);
+
+      setText("maxDrawdownValue", formatMoney(-(data.max_drawdown_amount ?? 0)));
+      setText("maxDrawdownSub", `${formatPct(-(data.max_drawdown_pct ?? 0))} vom Equity-Peak`);
+
+      setText("relDrawdownValue", formatPct(-(data.relative_drawdown_pct ?? 0)));
+
+      setText("exposureValue", formatPct(data.exposure_pct));
+      setText("volatilitySub", `Ann. Volatilitaet: ${formatPct(data.annual_volatility_pct)}`);
+
+      setText("buyHoldValue", formatPct(data.buy_hold_return_pct));
+      setText("avgTradeSub", `Ø Haltedauer: ${formatNumber(data.avg_bars_in_trade, 1)} Kerzen`);
+
+      setText("summaryText", data.summary || "Keine Zusammenfassung verfuegbar.");
+      setText("codeBlock", data.code || "");
+      renderTrades(data.trades || []);
+      renderChart(data);
+    }
+
+    function renderTrades(trades) {
+      const body = document.getElementById("tradesBody");
+      const rows = trades.slice(-10).reverse();
+      if (!rows.length) {
+        body.innerHTML = "<tr><td colspan=\"4\">Keine Trades im Backtest.</td></tr>";
+        return;
       }
 
-      const data = await res.json();
-      status.textContent = "✅ Backtest complete";
-
-      renderResults(data);
-      card.classList.remove("hidden");
-
-    } catch (e) {
-      status.className = "error";
-      status.textContent = `❌ ${e.message}`;
-    } finally {
-      btn.disabled = false;
-      btn.textContent = "▶ Run Backtest";
+      body.innerHTML = rows.map((trade) => `
+        <tr>
+          <td>${trade.direction ?? "-"}</td>
+          <td>${trade.entry_time ?? "-"}<br>${formatMoney(trade.entry_price)}</td>
+          <td>${trade.exit_time ?? "-"}<br>${formatMoney(trade.exit_price)}</td>
+          <td>${formatPct(trade.pnl_pct)}<br>1%: ${formatMoney(trade.pnl_amount_at_1pct, "EUR")}</td>
+        </tr>
+      `).join("");
     }
-  }
 
-  function renderResults(data) {
-    // Stats
-    const ret = data.total_return ?? 0;
-    const retEl = document.getElementById("statReturn");
-    retEl.textContent = `${ret >= 0 ? "+" : ""}${ret.toFixed(2)}%`;
-    retEl.className = "stat-value" + (ret < 0 ? " neg" : "");
-    document.getElementById("statBars").textContent = data.num_bars?.toLocaleString() ?? "—";
+    function renderChart(data) {
+      const equity = data.equity ?? [];
+      const equityPct = data.equity_pct ?? [];
+      const benchmark = data.benchmark_equity ?? [];
+      const benchmarkPct = data.benchmark_pct ?? [];
+      const labels = data.timestamps ?? equity.map((_, index) => String(index));
 
-    // Code
-    document.getElementById("codeBlock").textContent = data.code ?? "";
+      if (chart) chart.destroy();
 
-    // Chart
-    const equity = data.equity ?? [];
-    const labels = data.timestamps ?? equity.map((_, i) => i);
-
-    if (chart) chart.destroy();
-
-    const ctx = document.getElementById("equityChart").getContext("2d");
-    chart = new Chart(ctx, {
-      type: "line",
-      data: {
-        labels,
-        datasets: [{
-          label: "Equity Curve",
-          data: equity,
-          borderColor: "#22d3ee",
-          borderWidth: 2,
-          pointRadius: 0,
-          fill: true,
-          backgroundColor: (ctx) => {
-            const g = ctx.chart.ctx.createLinearGradient(0, 0, 0, 300);
-            g.addColorStop(0, "rgba(34,211,238,0.25)");
-            g.addColorStop(1, "rgba(34,211,238,0)");
-            return g;
+      const ctx = document.getElementById("equityChart").getContext("2d");
+      chart = new Chart(ctx, {
+        type: "line",
+        data: {
+          labels,
+          datasets: [
+            {
+              label: "Strategie",
+              data: equity,
+              borderColor: "#22d3ee",
+              borderWidth: 2,
+              pointRadius: 0,
+              fill: true,
+              backgroundColor: (context) => {
+                const gradient = context.chart.ctx.createLinearGradient(0, 0, 0, 340);
+                gradient.addColorStop(0, "rgba(34,211,238,0.22)");
+                gradient.addColorStop(1, "rgba(34,211,238,0)");
+                return gradient;
+              },
+              tension: 0.25,
+            },
+            {
+              label: "Benchmark Asset",
+              data: benchmark,
+              borderColor: "#f59e0b",
+              borderWidth: 2,
+              pointRadius: 0,
+              borderDash: [6, 5],
+              fill: false,
+              tension: 0.18,
+            },
+          ],
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: "index", intersect: false },
+          plugins: {
+            legend: {
+              display: true,
+              labels: {
+                color: "#cbd5e1",
+                boxWidth: 10,
+                boxHeight: 10,
+                usePointStyle: true,
+              },
+            },
+            tooltip: {
+              backgroundColor: "#161b27",
+              borderColor: "#1e2a3a",
+              borderWidth: 1,
+              callbacks: {
+                title: (items) => items?.[0]?.label ?? "",
+                label: (item) => {
+                  const pct = item.datasetIndex === 0
+                    ? equityPct[item.dataIndex]
+                    : benchmarkPct[item.dataIndex];
+                  return ` ${item.dataset.label}: ${formatMoney(item.parsed.y)} (${formatPct(pct)})`;
+                },
+              },
+            },
           },
-          tension: 0.3,
-        }],
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        interaction: { mode: "index", intersect: false },
-        plugins: {
-          legend: { display: false },
-          tooltip: {
-            backgroundColor: "#161b27",
-            borderColor: "#1e2a3a",
-            borderWidth: 1,
-            callbacks: {
-              label: (c) => ` Equity: ${c.parsed.y.toFixed(4)}`,
+          scales: {
+            x: {
+              ticks: {
+                color: "#64748b",
+                maxTicksLimit: 9,
+                maxRotation: 0,
+                callback: function(value) {
+                  const label = this.getLabelForValue(value);
+                  return String(label).slice(0, 10);
+                },
+              },
+              grid: { color: "#1e2a3a" },
+            },
+            y: {
+              ticks: {
+                color: "#64748b",
+                callback: (value) => formatMoney(value),
+              },
+              grid: { color: "#1e2a3a" },
             },
           },
         },
-        scales: {
-          x: {
-            ticks: { color: "#475569", maxTicksLimit: 10, maxRotation: 0 },
-            grid:  { color: "#1e2a3a" },
-          },
-          y: {
-            ticks: { color: "#475569" },
-            grid:  { color: "#1e2a3a" },
-          },
-        },
-      },
-    });
-  }
+      });
+    }
 
-  // Allow Ctrl+Enter to submit
-  document.getElementById("prompt").addEventListener("keydown", (e) => {
-    if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) runBacktest();
-  });
-</script>
+    document.getElementById("prompt").addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) runBacktest();
+    });
+  </script>
 </body>
 </html>
