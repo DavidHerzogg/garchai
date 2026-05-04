@@ -2,6 +2,7 @@ import ast
 import os
 import io
 import logging
+import math
 import re
 import textwrap
 import time
@@ -16,7 +17,7 @@ from botocore.config import Config
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
 ENGINE_DIR = Path(__file__).resolve().parent
@@ -78,35 +79,38 @@ OPENROUTER_REFERER = os.getenv("OPENROUTER_HTTP_REFERER", "http://localhost:8000
 OPENROUTER_TIMEOUT_SECONDS = float(os.getenv("OPENROUTER_TIMEOUT_SECONDS", "90"))
 STRATEGY_TIMEOUT_SECONDS = float(os.getenv("STRATEGY_TIMEOUT_SECONDS", "180"))
 MAX_CODE_ATTEMPTS = int(os.getenv("MAX_CODE_ATTEMPTS", "4"))
+MAX_OPTIMIZATION_RUNS = int(os.getenv("MAX_OPTIMIZATION_RUNS", "80"))
 R2_CONNECT_TIMEOUT_SECONDS = int(os.getenv("R2_CONNECT_TIMEOUT_SECONDS", "10"))
 R2_READ_TIMEOUT_SECONDS = int(os.getenv("R2_READ_TIMEOUT_SECONDS", "30"))
 MARKET_DATA_CACHE_SECONDS = float(os.getenv("MARKET_DATA_CACHE_SECONDS", "3600"))
 MARKET_DATA_CACHE: dict[str, object] = {"loaded_at": 0.0, "df": None}
 SYSTEM_PROMPT = """
-You are a robust quantitative trading code generator for price-action strategies.
-Return ONLY valid Python code, no markdown, no explanation.
-The function signature MUST be:
-    def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
-Available columns are guaranteed: timestamp, open, high, low, close, volume.
-Extra helper columns may exist: returns, log_return, bar_range, body, hl2, ohlc4.
-Supported strategy families: momentum, opening range breakout (ORB), trend following,
-mean reversion, volatility breakout, price/indicator relation strategies, and
-single-asset statistical-arbitrage/latency proxies based on spreads, returns,
-range, volume, rolling z-scores, and lead/lag features.
-Rules:
-- Implement the user's requested strategy directly. Never substitute a generic fallback.
-- If the request needs unavailable data, build the closest possible single-asset
-  proxy from OHLCV while preserving the user's strategy family and entry/exit idea.
-- Add column "signal" with values -1, 0, 1.
-- df is already chronological; do not sort by timestamp.
-- Do not assume unavailable columns or other assets exist.
-- If you use timestamp, use it only for hour/session filters, never as a required sort key.
-- Use only provided pd and np variables; do not write import statements.
-- Use vectorized pandas/numpy logic, no row loops, no network/file access, no while loops.
-- Do not use pandas apply/map/iterrows/itertuples or expensive custom Python callbacks.
-- Use ONLY past/current data: rolling(...).mean(), shift(1), expanding, etc.; no lookahead.
-- Always fill signal NaNs with 0 and cast to int before returning.
-- Return the modified df.
+You are a high-end quantitative trading engineer.
+Your task is to generate or refine a robust Python trading strategy based on the user's request and optional market context.
+
+### Quantitative Context & Capabilities:
+- **Available Data**: timestamp, open, high, low, close, volume.
+- **Helper Columns**: returns, log_return, bar_range, body, hl2, ohlc4.
+- **Advanced Concepts**: You should understand and be able to implement:
+    - **Volatility-Adjusted Sizing**: Use ATR or rolling std for position scaling or stop distance.
+    - **Market Regimes**: Adapt logic based on volatility (high/low), trend strength (ADX style), or momentum.
+    - **Risk Management**: Implement Trailing Stops, Time-based Exits, or Break-even logic if requested.
+    - **Statistical Arb**: Lead/lag features, rolling z-scores, mean reversion from dynamic bands.
+
+### Implementation Rules:
+- **Signature**: `def generate_signals(df: pd.DataFrame) -> pd.DataFrame:`
+- **Parameters**: You MUST define a top-level `PARAMS` dictionary for EVERY tunable constant or research assumption used by the strategy: periods, thresholds, quantiles, z-score levels, ATR multipliers, volatility windows, regime filters, holding limits, stop/take-profit multipliers, sizing multipliers, cooldown bars, confirmation bars, and boolean switches.
+    - Example: `PARAMS = {"rsi_period": 14, "entry_z": 1.5, "atr_mult": 2.0, "use_vol_filter": True}`
+    - Never hide a numeric or boolean tuning value directly inside indicator logic. Put it in `PARAMS` and use `PARAMS["name"]`.
+    - Prefer descriptive snake_case names because the web UI will automatically create editable input fields from `PARAMS`.
+    - Add enough parameters to make the idea researchable, but do not overfit with meaningless knobs.
+- **Vectorization**: Use ONLY pd and np vectorized logic. No loops, no `apply`, no `iterrows`.
+- **Lookahead**: NEVER use future data. Use `.shift(1)` for indicators that depend on the current bar's close if the entry is at the same bar, or ensure logic is causal.
+- **Output**: Add a "signal" column (-1, 0, 1). Fill NaNs with 0. Cast to int.
+- **No Imports**: Use `pd` and `np` directly; they are pre-injected.
+
+### Refinement Mode:
+If history is provided, maintain the core logic of the previous strategy unless explicitly asked to change it. Focus on the requested improvements (e.g., "Add a stop loss", "Only trade in high volatility").
 """
 
 SUMMARY_PROMPT = """
@@ -124,11 +128,13 @@ REPAIR_PROMPT = """
 You repair generated trading strategy Python code.
 Return ONLY valid Python code, no markdown, no explanation.
 The code must define:
+    PARAMS = {...}
     def generate_signals(df: pd.DataFrame) -> pd.DataFrame:
 Guaranteed columns: timestamp, open, high, low, close, volume, returns, log_return,
 bar_range, body, hl2, ohlc4.
 Rules:
 - Preserve the user's requested strategy logic. Do not replace it with a generic fallback.
+- Put every tunable numeric or boolean value in PARAMS and reference it from PARAMS in the strategy.
 - Do not sort by timestamp; data is already chronological.
 - Do not use columns that are not guaranteed.
 - No imports, no file/network access, no while loops, no row loops.
@@ -411,14 +417,13 @@ async def call_openrouter_completion(messages: list[dict], temperature: float = 
         return content.strip()
 
 
-async def call_openrouter(user_prompt: str) -> str:
-    return await call_openrouter_completion(
-        [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0,
-    )
+async def call_openrouter(user_prompt: str, history: list[dict] | None = None) -> str:
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    if history:
+        messages.extend(history)
+    messages.append({"role": "user", "content": user_prompt})
+
+    return await call_openrouter_completion(messages, temperature=0)
 
 
 def heuristic_strategy_summary(prompt: str, code: str) -> str:
@@ -649,6 +654,245 @@ def validate_generated_ast(tree: ast.AST) -> None:
                 raise ValueError(f"Generated code calls forbidden method: {func.attr}")
 
 
+def extract_params(code: str) -> dict:
+    try:
+        tree = ast.parse(code)
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name) and target.id == "PARAMS":
+                        if isinstance(node.value, ast.Dict):
+                            return {
+                                ast.literal_eval(k): ast.literal_eval(v)
+                                for k, v in zip(node.value.keys, node.value.values)
+                                if k is not None
+                            }
+    except Exception:
+        pass
+    return {}
+
+
+def normalize_param_value(value):
+    if isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if math.isfinite(float(value)):
+            return int(value) if isinstance(value, int) else float(value)
+        return None
+    if isinstance(value, str):
+        return value
+    return value
+
+
+def infer_numeric_bounds(value: float | int, name: str) -> tuple[float, float, float]:
+    lower_name = name.lower()
+    is_integer = isinstance(value, int) and not isinstance(value, bool)
+    numeric = float(value)
+
+    if is_integer:
+        if any(token in lower_name for token in ["period", "window", "lookback", "bars", "len", "length"]):
+            lower = max(2, int(round(numeric * 0.5)))
+            upper = max(lower + 1, int(round(numeric * 2.5)))
+        elif any(token in lower_name for token in ["hour", "session", "cooldown", "hold"]):
+            lower = max(0, int(round(numeric * 0.5)))
+            upper = max(lower + 1, int(round(numeric * 2 + 4)))
+        else:
+            lower = max(0, int(round(numeric - max(2, abs(numeric) * 0.5))))
+            upper = max(lower + 1, int(round(numeric + max(2, abs(numeric) * 0.5))))
+        return float(lower), float(upper), 1.0
+
+    if any(token in lower_name for token in ["quantile", "percentile"]):
+        return 0.01, 0.99, 0.01
+    if any(token in lower_name for token in ["ratio", "fraction", "weight", "prob", "rate"]):
+        if 0 <= numeric <= 1:
+            return 0.0, 1.0, 0.01
+    if any(token in lower_name for token in ["z", "threshold", "entry", "exit"]):
+        spread = max(0.25, abs(numeric) * 1.25)
+        return numeric - spread, numeric + spread, 0.05
+    if any(token in lower_name for token in ["mult", "factor", "atr", "std", "vol"]):
+        lower = max(0.01, numeric * 0.4)
+        upper = max(lower + 0.01, numeric * 2.5)
+        return lower, upper, 0.05
+
+    spread = max(0.1, abs(numeric) * 0.75)
+    return numeric - spread, numeric + spread, 0.01
+
+
+def build_param_schema(params: dict) -> list[dict]:
+    schema: list[dict] = []
+    for name, raw_value in params.items():
+        value = normalize_param_value(raw_value)
+        if isinstance(value, bool):
+            schema.append(
+                {
+                    "name": str(name),
+                    "type": "boolean",
+                    "value": value,
+                    "optimizer_enabled": False,
+                }
+            )
+            continue
+        if isinstance(value, int) and not isinstance(value, bool):
+            min_value, max_value, step = infer_numeric_bounds(value, str(name))
+            schema.append(
+                {
+                    "name": str(name),
+                    "type": "integer",
+                    "value": value,
+                    "min": int(round(min_value)),
+                    "max": int(round(max_value)),
+                    "step": int(step),
+                    "optimizer_min": int(round(min_value)),
+                    "optimizer_max": int(round(max_value)),
+                    "optimizer_steps": 5,
+                    "optimizer_enabled": True,
+                }
+            )
+            continue
+        if isinstance(value, float):
+            min_value, max_value, step = infer_numeric_bounds(value, str(name))
+            schema.append(
+                {
+                    "name": str(name),
+                    "type": "number",
+                    "value": round(value, 8),
+                    "min": round(min_value, 8),
+                    "max": round(max_value, 8),
+                    "step": step,
+                    "optimizer_min": round(min_value, 8),
+                    "optimizer_max": round(max_value, 8),
+                    "optimizer_steps": 5,
+                    "optimizer_enabled": True,
+                }
+            )
+            continue
+        schema.append(
+            {
+                "name": str(name),
+                "type": "text",
+                "value": "" if value is None else str(value),
+                "optimizer_enabled": False,
+            }
+        )
+    return schema
+
+
+def require_strategy_params(code: str) -> dict:
+    params = extract_params(code)
+    if not isinstance(params, dict) or not params:
+        raise ValueError(
+            "Generated strategy must define a non-empty top-level PARAMS dict so the UI can expose all tunable variables."
+        )
+    return {str(key): normalize_param_value(value) for key, value in params.items()}
+
+
+def coerce_param_overrides(base_params: dict, overrides: dict | None) -> dict | None:
+    if not overrides:
+        return None
+
+    coerced: dict = {}
+    for key, raw_value in overrides.items():
+        name = str(key)
+        if name not in base_params:
+            continue
+        base_value = base_params[name]
+        try:
+            if isinstance(base_value, bool):
+                if isinstance(raw_value, str):
+                    coerced[name] = raw_value.strip().lower() in {"1", "true", "yes", "on"}
+                else:
+                    coerced[name] = bool(raw_value)
+            elif isinstance(base_value, int) and not isinstance(base_value, bool):
+                coerced[name] = int(round(float(raw_value)))
+            elif isinstance(base_value, float):
+                coerced[name] = float(raw_value)
+            else:
+                coerced[name] = raw_value
+        except (TypeError, ValueError):
+            continue
+    return coerced
+
+
+def linspace_values(min_value: float, max_value: float, steps: int, as_integer: bool) -> list:
+    steps = int(max(1, min(steps, 21)))
+    if steps == 1:
+        values = [min_value]
+    else:
+        values = np.linspace(min_value, max_value, steps).tolist()
+    if as_integer:
+        return sorted({int(round(value)) for value in values})
+    return [round(float(value), 8) for value in values]
+
+
+def default_param_ranges(params: dict, schema: list[dict] | None = None) -> dict:
+    schema_by_name = {item["name"]: item for item in (schema or build_param_schema(params))}
+    ranges: dict = {}
+    for name, value in params.items():
+        item = schema_by_name.get(str(name))
+        if not item or not item.get("optimizer_enabled"):
+            continue
+        ranges[str(name)] = linspace_values(
+            float(item["optimizer_min"]),
+            float(item["optimizer_max"]),
+            int(item.get("optimizer_steps") or 5),
+            item["type"] == "integer",
+        )
+    return ranges
+
+
+def sanitize_param_ranges(params: dict, requested_ranges: dict | None, max_runs: int) -> tuple[dict, int]:
+    schema = build_param_schema(params)
+    ranges = default_param_ranges(params, schema)
+    requested_ranges = requested_ranges or {}
+
+    for name, values in requested_ranges.items():
+        if str(name) not in params:
+            continue
+        base_value = params[str(name)]
+        if isinstance(base_value, bool):
+            continue
+        if not isinstance(base_value, (int, float)):
+            continue
+        if not isinstance(values, list):
+            continue
+        cleaned = []
+        for value in values[:31]:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(numeric):
+                continue
+            cleaned.append(int(round(numeric)) if isinstance(base_value, int) else round(numeric, 8))
+        cleaned = sorted(set(cleaned))
+        if cleaned:
+            ranges[str(name)] = cleaned
+
+    capped_runs = max(1, min(int(max_runs or MAX_OPTIMIZATION_RUNS), MAX_OPTIMIZATION_RUNS))
+    total = 1
+    for values in ranges.values():
+        total *= max(1, len(values))
+
+    if total <= capped_runs:
+        return ranges, total
+
+    # Thin large grids deterministically so every parameter still participates.
+    reduced = {name: list(values) for name, values in ranges.items()}
+    while total > capped_runs and any(len(values) > 1 for values in reduced.values()):
+        name = max(reduced, key=lambda key: len(reduced[key]))
+        values = reduced[name]
+        if len(values) <= 1:
+            break
+        keep_count = max(1, len(values) - 1)
+        indices = np.unique(np.rint(np.linspace(0, len(values) - 1, keep_count)).astype(int))
+        reduced[name] = [values[int(index)] for index in indices]
+        total = 1
+        for values in reduced.values():
+            total *= max(1, len(values))
+
+    return reduced, total
+
+
 def compile_generated_code(raw_code: str) -> str:
     candidates = []
     normalized = normalize_generated_code(raw_code)
@@ -676,8 +920,8 @@ def compile_generated_code(raw_code: str) -> str:
 def execute_strategy_worker(code: str, df: pd.DataFrame, output_queue) -> None:
     try:
         code = compile_generated_code(code)
-        namespace: dict = {}
-        exec(code, {"pd": pd, "np": __import__("numpy")}, namespace)
+        namespace: dict = {"pd": pd, "np": np}
+        exec(code, namespace)
         if "generate_signals" not in namespace:
             raise ValueError("generate_signals function not found in generated code")
 
@@ -692,9 +936,8 @@ def execute_strategy_worker(code: str, df: pd.DataFrame, output_queue) -> None:
         output_queue.put(("error", f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"))
 
 
-def execute_strategy(code: str, df: pd.DataFrame) -> pd.DataFrame:
+def execute_strategy(code: str, df: pd.DataFrame, params_override: dict | None = None) -> pd.DataFrame:
     code = compile_generated_code(code)
-    namespace: dict = {}
     safe_builtins = {
         "abs": abs,
         "bool": bool,
@@ -705,7 +948,13 @@ def execute_strategy(code: str, df: pd.DataFrame) -> pd.DataFrame:
         "min": min,
         "round": round,
     }
-    exec(code, {"pd": pd, "np": np, "__builtins__": safe_builtins}, namespace)
+    namespace: dict = {"pd": pd, "np": np, "__builtins__": safe_builtins}
+    exec(code, namespace)
+
+    if params_override and "PARAMS" in namespace:
+        if isinstance(namespace["PARAMS"], dict):
+            namespace["PARAMS"].update(params_override)
+
     if "generate_signals" not in namespace:
         raise ValueError("generate_signals function not found in generated code")
 
@@ -761,6 +1010,7 @@ def make_smoke_test_data(rows: int = 320) -> pd.DataFrame:
 
 def smoke_test_strategy_code(code: str) -> str:
     compiled = compile_generated_code(code)
+    require_strategy_params(compiled)
     smoke_df = make_smoke_test_data()
     started = time.perf_counter()
     result = execute_strategy(compiled, smoke_df)
@@ -810,9 +1060,30 @@ def run_backtest(df: pd.DataFrame) -> dict:
     return _bt(df)
 
 
-def backtest_code(code: str, market_df: pd.DataFrame | None = None) -> dict:
+def backtest_prepared_code(prompt: str, code: str, market_df: pd.DataFrame, params: dict | None = None) -> dict:
+    compiled = smoke_test_strategy_code(code)
+    started = time.perf_counter()
+    result = backtest_code(compiled, market_df, params)
+    strategy_seconds = time.perf_counter() - started
+    summary = heuristic_strategy_summary(prompt, compiled)
+    extracted_params = require_strategy_params(compiled)
+    active_params = {**extracted_params, **(coerce_param_overrides(extracted_params, params) or {})}
+    return {
+        **result,
+        "code": compiled,
+        "params": extracted_params,
+        "active_params": active_params,
+        "param_schema": build_param_schema(extracted_params),
+        "summary": summary,
+        "attempts": 1,
+        "strategy_seconds": round(strategy_seconds, 3),
+    }
+
+
+def backtest_code(code: str, market_df: pd.DataFrame | None = None, params: dict | None = None) -> dict:
     df = ensure_market_data(market_df if market_df is not None else load_parquet_from_r2())
-    df = execute_strategy(code, df)
+    base_params = require_strategy_params(code)
+    df = execute_strategy(code, df, coerce_param_overrides(base_params, params))
 
     if "signal" not in df.columns:
         raise ValueError("Strategy did not produce a 'signal' column")
@@ -820,24 +1091,9 @@ def backtest_code(code: str, market_df: pd.DataFrame | None = None) -> dict:
     return run_backtest(df)
 
 
-def backtest_prepared_code(prompt: str, code: str, market_df: pd.DataFrame) -> dict:
-    compiled = smoke_test_strategy_code(code)
+async def generate_strategy(prompt: str, history: list[dict] | None = None) -> dict:
     started = time.perf_counter()
-    result = backtest_code(compiled, market_df)
-    strategy_seconds = time.perf_counter() - started
-    summary = heuristic_strategy_summary(prompt, compiled)
-    return {
-        **result,
-        "code": compiled,
-        "summary": summary,
-        "attempts": 1,
-        "strategy_seconds": round(strategy_seconds, 3),
-    }
-
-
-async def generate_strategy(prompt: str) -> dict:
-    started = time.perf_counter()
-    raw_code = await call_openrouter(prompt)
+    raw_code = await call_openrouter(prompt, history)
     code, repair_errors = await prepare_strategy_code(prompt, raw_code)
     timings = {"api_seconds": round(time.perf_counter() - started, 3)}
     if repair_errors:
@@ -871,19 +1127,354 @@ async def run_prompt(prompt: str) -> dict:
     return {**result, "timings": timings}
 
 
+def selected_metric(result: dict, metric: str) -> float:
+    candidates = [metric, "sharpe_ratio", "sortino_ratio", "calmar_ratio", "total_return_pct"]
+    for key in candidates:
+        value = result.get(key)
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            return float(value)
+    return -float("inf")
+
+
+def compact_metrics(result: dict, metric: str) -> dict:
+    return {
+        "metric": metric,
+        "metric_value": round(selected_metric(result, metric), 4),
+        "total_return_pct": result.get("total_return_pct"),
+        "annual_return_pct": result.get("annual_return_pct"),
+        "sharpe_ratio": result.get("sharpe_ratio"),
+        "sortino_ratio": result.get("sortino_ratio"),
+        "calmar_ratio": result.get("calmar_ratio"),
+        "max_drawdown_pct": result.get("max_drawdown_pct"),
+        "win_rate": result.get("win_rate"),
+        "profit_factor": result.get("profit_factor"),
+        "expectancy": result.get("expectancy"),
+        "trades_total": result.get("trades_total"),
+        "alpha_decay_half_life_bars": result.get("alpha_decay_half_life_bars"),
+    }
+
+
+def build_optimization_rows(
+    compiled_code: str,
+    prompt: str,
+    market_df: pd.DataFrame,
+    base_params: dict,
+    ranges: dict,
+    metric: str,
+) -> list[dict]:
+    from itertools import product
+
+    keys = list(ranges.keys())
+    if not keys:
+        values_grid = [()]
+    else:
+        values_grid = product(*(ranges[key] for key in keys))
+
+    rows: list[dict] = []
+    for values in values_grid:
+        params = {**base_params, **dict(zip(keys, values))}
+        try:
+            result = backtest_code(compiled_code, market_df, params)
+        except Exception as exc:
+            logger.warning("Optimization point failed for %s: %s", params, exc)
+            continue
+        rows.append(
+            {
+                "params": params,
+                "metric_value": selected_metric(result, metric),
+                "metrics": result,
+                "compact": compact_metrics(result, metric),
+                "folds": result.get("validation_folds", []),
+            }
+        )
+    rows.sort(key=lambda row: row["metric_value"], reverse=True)
+    return rows
+
+
+def optimization_leaderboard(rows: list[dict], metric: str, limit: int = 20) -> list[dict]:
+    return [
+        {
+            "rank": index + 1,
+            "params": row["params"],
+            **compact_metrics(row["metrics"], metric),
+        }
+        for index, row in enumerate(rows[:limit])
+    ]
+
+
+def optimization_surface(rows: list[dict], ranges: dict, metric: str) -> dict:
+    varied_keys = [key for key, values in ranges.items() if len(values) > 1]
+    if not varied_keys:
+        return {"x_param": None, "y_param": None, "points": []}
+
+    x_param = varied_keys[0]
+    y_param = varied_keys[1] if len(varied_keys) > 1 else None
+    points = []
+    for row in rows:
+        params = row["params"]
+        points.append(
+            {
+                "x": params.get(x_param),
+                "y": params.get(y_param) if y_param else 0,
+                "z": round(selected_metric(row["metrics"], metric), 4),
+                "params": params,
+            }
+        )
+    return {"x_param": x_param, "y_param": y_param, "points": points}
+
+
+def parameter_sensitivity(rows: list[dict], ranges: dict, metric: str) -> list[dict]:
+    output: list[dict] = []
+    for key, values in ranges.items():
+        buckets = []
+        for value in values:
+            metric_values = [
+                selected_metric(row["metrics"], metric)
+                for row in rows
+                if row["params"].get(key) == value
+            ]
+            finite = [value for value in metric_values if math.isfinite(float(value))]
+            if not finite:
+                continue
+            buckets.append(
+                {
+                    "value": value,
+                    "runs": len(finite),
+                    "mean_metric": round(float(np.mean(finite)), 4),
+                    "median_metric": round(float(np.median(finite)), 4),
+                }
+            )
+        if not buckets:
+            continue
+        best_bucket = max(buckets, key=lambda item: item["mean_metric"])
+        worst_bucket = min(buckets, key=lambda item: item["mean_metric"])
+        output.append(
+            {
+                "param": key,
+                "best_value": best_bucket["value"],
+                "worst_value": worst_bucket["value"],
+                "spread": round(best_bucket["mean_metric"] - worst_bucket["mean_metric"], 4),
+                "buckets": buckets,
+            }
+        )
+    return output
+
+
+def stability_report(rows: list[dict], metric: str) -> dict:
+    if not rows:
+        return {}
+
+    metric_values = np.array(
+        [selected_metric(row["metrics"], metric) for row in rows],
+        dtype=np.float64,
+    )
+    finite_metric = metric_values[np.isfinite(metric_values)]
+    returns = np.array(
+        [
+            float(row["metrics"].get("total_return_pct") or 0)
+            for row in rows
+        ],
+        dtype=np.float64,
+    )
+    sharpes = np.array(
+        [
+            float(row["metrics"].get("sharpe_ratio") or 0)
+            for row in rows
+        ],
+        dtype=np.float64,
+    )
+    if len(finite_metric) == 0:
+        return {}
+
+    q25, q75 = np.nanpercentile(finite_metric, [25, 75])
+    top_decile = np.nanpercentile(finite_metric, 90)
+    return {
+        "runs": int(len(rows)),
+        "metric": metric,
+        "median_metric": round(float(np.nanmedian(finite_metric)), 4),
+        "mean_metric": round(float(np.nanmean(finite_metric)), 4),
+        "iqr": round(float(q75 - q25), 4),
+        "best_metric": round(float(np.nanmax(finite_metric)), 4),
+        "worst_metric": round(float(np.nanmin(finite_metric)), 4),
+        "top_decile_metric": round(float(top_decile), 4),
+        "profitable_param_rate_pct": round(float(np.mean(returns > 0) * 100), 2),
+        "positive_sharpe_rate_pct": round(float(np.mean(sharpes > 0) * 100), 2),
+    }
+
+
+def estimate_pbo(rows: list[dict], metric: str) -> dict:
+    if len(rows) < 5:
+        return {
+            "available": False,
+            "reason": "PBO needs at least five parameter candidates.",
+        }
+
+    fold_ids = sorted(
+        {
+            int(fold["fold"])
+            for row in rows
+            for fold in row.get("folds", [])
+            if isinstance(fold.get("fold"), int)
+        }
+    )
+    if len(fold_ids) < 4:
+        return {
+            "available": False,
+            "reason": "PBO needs at least four validation folds.",
+        }
+
+    fold_index = {fold_id: index for index, fold_id in enumerate(fold_ids)}
+    matrix = np.full((len(rows), len(fold_ids)), np.nan, dtype=np.float64)
+    fold_metric_key = "sharpe_ratio" if "sharpe" in metric else "return_pct"
+    for row_index, row in enumerate(rows):
+        for fold in row.get("folds", []):
+            fold_id = fold.get("fold")
+            if fold_id not in fold_index:
+                continue
+            value = fold.get(fold_metric_key)
+            if isinstance(value, (int, float)) and math.isfinite(float(value)):
+                matrix[row_index, fold_index[fold_id]] = float(value)
+
+    if np.isfinite(matrix).sum() < len(rows) * 2:
+        return {
+            "available": False,
+            "reason": "Not enough finite fold scores for PBO.",
+        }
+
+    from itertools import combinations
+
+    fold_indices = list(range(len(fold_ids)))
+    train_size = max(2, len(fold_indices) // 2)
+    splits = list(combinations(fold_indices, train_size))
+    if len(splits) > 126:
+        selected = np.unique(np.rint(np.linspace(0, len(splits) - 1, 126)).astype(int))
+        splits = [splits[int(index)] for index in selected]
+
+    rank_percentiles: list[float] = []
+    train_test_spreads: list[float] = []
+    for train_tuple in splits:
+        train = np.array(train_tuple, dtype=np.int64)
+        test = np.array([index for index in fold_indices if index not in train_tuple], dtype=np.int64)
+        if len(test) == 0:
+            continue
+        train_slice = matrix[:, train]
+        test_slice = matrix[:, test]
+        train_counts = np.isfinite(train_slice).sum(axis=1)
+        test_counts = np.isfinite(test_slice).sum(axis=1)
+        train_scores = np.full(len(rows), np.nan, dtype=np.float64)
+        test_scores = np.full(len(rows), np.nan, dtype=np.float64)
+        train_scores[train_counts > 0] = np.nansum(train_slice[train_counts > 0], axis=1) / train_counts[train_counts > 0]
+        test_scores[test_counts > 0] = np.nansum(test_slice[test_counts > 0], axis=1) / test_counts[test_counts > 0]
+        finite_train = np.isfinite(train_scores)
+        finite_test = np.isfinite(test_scores)
+        if finite_train.sum() < 2 or finite_test.sum() < 2:
+            continue
+        best_train_index = int(np.nanargmax(np.where(finite_train, train_scores, -np.inf)))
+        selected_test_score = test_scores[best_train_index]
+        if not math.isfinite(float(selected_test_score)):
+            continue
+        finite_test_scores = test_scores[finite_test]
+        rank = float(np.mean(finite_test_scores <= selected_test_score) * 100)
+        rank_percentiles.append(rank)
+        train_test_spreads.append(float(train_scores[best_train_index] - selected_test_score))
+
+    if not rank_percentiles:
+        return {
+            "available": False,
+            "reason": "No valid train/test PBO split could be computed.",
+        }
+
+    rank_array = np.array(rank_percentiles, dtype=np.float64)
+    pbo = float(np.mean(rank_array < 50) * 100)
+    return {
+        "available": True,
+        "method": "Combinatorially symmetric cross-validation over chronological folds",
+        "metric": fold_metric_key,
+        "folds": int(len(fold_ids)),
+        "splits": int(len(rank_percentiles)),
+        "pbo_probability_pct": round(pbo, 2),
+        "median_oos_rank_pct": round(float(np.median(rank_array)), 2),
+        "rank_percentiles": [round(float(value), 2) for value in rank_percentiles],
+        "median_train_test_degradation": round(float(np.median(train_test_spreads)), 4),
+    }
+
+
+def run_parameter_research(
+    prompt: str,
+    code: str,
+    market_df: pd.DataFrame,
+    params: dict | None,
+    param_ranges: dict | None,
+    metric: str,
+    max_runs: int,
+) -> dict:
+    compiled = smoke_test_strategy_code(code)
+    base_params = require_strategy_params(compiled)
+    active_params = {**base_params, **(coerce_param_overrides(base_params, params) or {})}
+    ranges, planned_runs = sanitize_param_ranges(active_params, param_ranges, max_runs)
+    started = time.perf_counter()
+    rows = build_optimization_rows(compiled, prompt, market_df, active_params, ranges, metric)
+    elapsed = time.perf_counter() - started
+    if not rows:
+        raise ValueError("No optimization candidate produced a valid backtest.")
+
+    best = rows[0]
+    return {
+        "code": compiled,
+        "base_params": base_params,
+        "active_params": active_params,
+        "param_schema": build_param_schema(base_params),
+        "ranges": ranges,
+        "planned_runs": planned_runs,
+        "completed_runs": len(rows),
+        "metric": metric,
+        "best": {
+            "params": best["params"],
+            "metric_value": round(float(best["metric_value"]), 4),
+            "metrics": {
+                **best["metrics"],
+                "code": compiled,
+                "params": base_params,
+                "active_params": best["params"],
+                "param_schema": build_param_schema(base_params),
+                "summary": heuristic_strategy_summary(prompt, compiled),
+            },
+        },
+        "leaderboard": optimization_leaderboard(rows, metric),
+        "surface": optimization_surface(rows, ranges, metric),
+        "sensitivity": parameter_sensitivity(rows, ranges, metric),
+        "stability": stability_report(rows, metric),
+        "pbo": estimate_pbo(rows, metric),
+        "research_seconds": round(elapsed, 3),
+    }
+
+
 # ── Routes ───────────────────────────────────────────────────────────────────
 
 class GenerateRequest(BaseModel):
     prompt: str
+    history: list[dict] | None = None
 
 class BacktestRequest(BaseModel):
     code: str
     prompt: str = ""
+    params: dict | None = None
+
+class OptimizeRequest(BaseModel):
+    code: str
+    prompt: str = ""
+    params: dict | None = None
+    param_ranges: dict = Field(default_factory=dict)
+    metric: str = "sharpe_ratio"
+    max_runs: int = MAX_OPTIMIZATION_RUNS
 
 @app.post("/generate")
 async def generate(req: GenerateRequest):
     try:
-        return await generate_strategy(req.prompt)
+        res = await generate_strategy(req.prompt, req.history)
+        res["params"] = require_strategy_params(res["code"])
+        res["param_schema"] = build_param_schema(res["params"])
+        return res
     except ValueError as e:
         logger.exception("Strategy generation/validation failed")
         raise HTTPException(status_code=422, detail=f"{type(e).__name__}: {e}")
@@ -897,7 +1488,7 @@ async def backtest(req: BacktestRequest):
         total_started = time.perf_counter()
         market_df, cache_hit, data_seconds = get_market_data()
         backtest_started = time.perf_counter()
-        result = backtest_prepared_code(req.prompt, req.code, market_df)
+        result = backtest_prepared_code(req.prompt, req.code, market_df, req.params)
         result["timings"] = {
             "data_seconds": round(data_seconds, 3),
             "backtest_seconds": round(time.perf_counter() - backtest_started, 3),
@@ -913,6 +1504,28 @@ async def backtest(req: BacktestRequest):
     except Exception as e:
         logger.exception("Backtest failed")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+@app.post("/optimize")
+async def optimize(req: OptimizeRequest):
+    try:
+        market_df, _, _ = get_market_data()
+        return run_parameter_research(
+            prompt=req.prompt,
+            code=req.code,
+            market_df=market_df,
+            params=req.params,
+            param_ranges=req.param_ranges,
+            metric=req.metric,
+            max_runs=req.max_runs,
+        )
+
+    except Exception as e:
+        logger.exception("Optimization failed")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/research")
+async def research(req: OptimizeRequest):
+    return await optimize(req)
 
 @app.post("/run")
 async def run(req: GenerateRequest):

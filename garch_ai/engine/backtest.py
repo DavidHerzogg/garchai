@@ -12,6 +12,8 @@ FALLBACK_PERIODS_PER_YEAR = 24 * 252
 SECONDS_PER_YEAR = 365.25 * 24 * 60 * 60
 MAX_RESPONSE_POINTS = int(os.getenv("BACKTEST_MAX_RESPONSE_POINTS", "1800"))
 MAX_RETURNED_TRADES = int(os.getenv("BACKTEST_MAX_RETURNED_TRADES", "50"))
+MAX_ALPHA_DECAY_LAG = int(os.getenv("BACKTEST_MAX_ALPHA_DECAY_LAG", "96"))
+MAX_RETURN_DISTRIBUTION_BINS = int(os.getenv("BACKTEST_RETURN_DISTRIBUTION_BINS", "36"))
 
 
 def rounded(value: float | int | None, digits: int = 2):
@@ -286,15 +288,22 @@ def summarize_trades(trade_data: dict) -> dict:
     gross_loss = abs(float(losses.sum()))
     profit_factor = None if gross_loss == 0 else gross_profit / gross_loss
 
+    # Quant metrics
+    avg_trade = float(finite_pnls.mean())
+    win_rate = (len(wins) / total) * 100 if total > 0 else 0
+    expectancy = (win_rate / 100 * (wins.mean() if len(wins) > 0 else 0)) + \
+                 ((1 - win_rate / 100) * (losses.mean() if len(losses) > 0 else 0))
+
     return {
         "trades_total": total,
         "long_trades": int(np.sum(sides > 0)),
         "short_trades": int(np.sum(sides < 0)),
         "winning_trades": int(len(wins)),
         "losing_trades": int(len(losses)),
-        "win_rate": rounded((len(wins) / total) * 100),
+        "win_rate": rounded(win_rate),
         "profit_factor": rounded(profit_factor),
-        "average_trade": rounded(float(finite_pnls.mean())),
+        "expectancy": rounded(expectancy),
+        "average_trade": rounded(avg_trade),
         "best_trade": rounded(float(finite_pnls.max())),
         "worst_trade": rounded(float(finite_pnls.min())),
         "avg_bars_in_trade": rounded(float(np.mean(bars)) if len(bars) else 0, 1),
@@ -346,6 +355,385 @@ def rounded_list(values: np.ndarray, digits: int = 2) -> list:
     return [rounded(float(value), digits) for value in values]
 
 
+def finite_values(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float64)
+    return values[np.isfinite(values)]
+
+
+def safe_percentile(values: np.ndarray, percentile: float) -> float | None:
+    finite = finite_values(values)
+    if len(finite) == 0:
+        return None
+    return float(np.nanpercentile(finite, percentile))
+
+
+def safe_correlation(left: np.ndarray, right: np.ndarray) -> float | None:
+    left = np.asarray(left, dtype=np.float64)
+    right = np.asarray(right, dtype=np.float64)
+    count = min(len(left), len(right))
+    if count < 3:
+        return None
+
+    left = left[:count]
+    right = right[:count]
+    mask = np.isfinite(left) & np.isfinite(right)
+    if mask.sum() < 3:
+        return None
+    left = left[mask]
+    right = right[mask]
+    if float(np.std(left)) == 0 or float(np.std(right)) == 0:
+        return None
+    return float(np.corrcoef(left, right)[0, 1])
+
+
+def compound_return_pct(returns: np.ndarray) -> float:
+    finite = np.nan_to_num(np.asarray(returns, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0)
+    if len(finite) == 0:
+        return 0
+    return (float(np.prod(1 + finite)) - 1) * 100
+
+
+def max_consecutive_true(mask: np.ndarray) -> int:
+    mask = np.asarray(mask, dtype=bool)
+    if len(mask) == 0 or not mask.any():
+        return 0
+    padded = np.r_[False, mask, False]
+    changes = np.flatnonzero(padded[1:] != padded[:-1])
+    lengths = changes[1::2] - changes[::2]
+    return int(lengths.max()) if len(lengths) else 0
+
+
+def return_distribution(values: np.ndarray) -> list[dict]:
+    returns_pct = finite_values(values * 100)
+    if len(returns_pct) == 0:
+        return []
+
+    bins = min(MAX_RETURN_DISTRIBUTION_BINS, max(8, int(math.sqrt(len(returns_pct)))))
+    counts, edges = np.histogram(returns_pct, bins=bins)
+    rows: list[dict] = []
+    for index, count in enumerate(counts):
+        start = float(edges[index])
+        end = float(edges[index + 1])
+        rows.append(
+            {
+                "bin_start_pct": rounded(start, 4),
+                "bin_end_pct": rounded(end, 4),
+                "bin_mid_pct": rounded((start + end) / 2, 4),
+                "count": int(count),
+            }
+        )
+    return rows
+
+
+def rolling_window(length: int, periods_per_year: float) -> int:
+    if length <= 2:
+        return 2
+    monthly = int(max(24, min(periods_per_year / 12, 24 * 30)))
+    return int(min(max(12, monthly), max(12, length // 3)))
+
+
+def rolling_research_series(
+    strategy_returns: np.ndarray,
+    chart_indices: np.ndarray,
+    periods_per_year: float,
+) -> dict:
+    if len(strategy_returns) == 0:
+        return {
+            "rolling_window": 0,
+            "rolling_sharpe": [],
+            "rolling_volatility_pct": [],
+            "rolling_win_rate_pct": [],
+            "rolling_profit_factor": [],
+        }
+
+    window = rolling_window(len(strategy_returns), periods_per_year)
+    series = pd.Series(strategy_returns)
+    rolling_mean = series.rolling(window, min_periods=max(4, window // 3)).mean()
+    rolling_std = series.rolling(window, min_periods=max(4, window // 3)).std(ddof=0)
+    rolling_sharpe = rolling_mean / rolling_std.replace(0, np.nan) * math.sqrt(periods_per_year)
+    rolling_vol = rolling_std * math.sqrt(periods_per_year) * 100
+    rolling_win_rate = (series > 0).rolling(window, min_periods=max(4, window // 3)).mean() * 100
+    gross_wins = series.clip(lower=0).rolling(window, min_periods=max(4, window // 3)).sum()
+    gross_losses = (-series.clip(upper=0)).rolling(window, min_periods=max(4, window // 3)).sum()
+    rolling_profit_factor = gross_wins / gross_losses.replace(0, np.nan)
+
+    return {
+        "rolling_window": int(window),
+        "rolling_sharpe": rounded_list(rolling_sharpe.to_numpy()[chart_indices], 2),
+        "rolling_volatility_pct": rounded_list(rolling_vol.to_numpy()[chart_indices], 2),
+        "rolling_win_rate_pct": rounded_list(rolling_win_rate.to_numpy()[chart_indices], 2),
+        "rolling_profit_factor": rounded_list(rolling_profit_factor.to_numpy()[chart_indices], 2),
+    }
+
+
+def segment_drawdown_pct(equity: np.ndarray) -> float:
+    if len(equity) == 0:
+        return 0
+    peak = np.maximum.accumulate(equity)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        drawdown = np.where(peak != 0, equity / peak - 1, 0)
+    return abs(float(np.nanmin(drawdown))) * 100
+
+
+def validation_fold_report(
+    strategy_returns: np.ndarray,
+    periods_per_year: float,
+    fold_count: int = 8,
+) -> list[dict]:
+    length = len(strategy_returns)
+    if length < 4:
+        return []
+
+    fold_count = max(2, min(fold_count, length))
+    folds = np.array_split(np.arange(length, dtype=np.int64), fold_count)
+    rows: list[dict] = []
+    for fold_index, indices in enumerate(folds, start=1):
+        if len(indices) == 0:
+            continue
+        returns = strategy_returns[indices]
+        equity = np.cumprod(1 + np.nan_to_num(returns, nan=0.0, posinf=0.0, neginf=0.0))
+        std = float(np.std(returns))
+        sharpe = (
+            float(np.mean(returns)) / std * math.sqrt(periods_per_year)
+            if std > 0
+            else None
+        )
+        rows.append(
+            {
+                "fold": fold_index,
+                "bars": int(len(indices)),
+                "return_pct": rounded(compound_return_pct(returns), 2),
+                "sharpe_ratio": rounded(sharpe, 2),
+                "max_drawdown_pct": rounded(segment_drawdown_pct(equity), 2),
+                "hit_rate_pct": rounded(float(np.mean(returns > 0) * 100), 2),
+            }
+        )
+    return rows
+
+
+def monthly_return_report(seconds: np.ndarray | None, account_equity: np.ndarray) -> list[dict]:
+    if seconds is None or len(seconds) != len(account_equity):
+        return []
+
+    mask = np.isfinite(seconds) & np.isfinite(account_equity)
+    if mask.sum() < 2:
+        return []
+
+    parsed = pd.to_datetime(seconds[mask], unit="s", errors="coerce", utc=True)
+    equity = account_equity[mask]
+    valid = pd.Series(parsed).notna().to_numpy()
+    if valid.sum() < 2:
+        return []
+
+    parsed = parsed[valid].tz_convert(None)
+    equity = equity[valid]
+    periods = pd.PeriodIndex(parsed, freq="M")
+    rows: list[dict] = []
+    for period in periods.unique():
+        period_mask = periods == period
+        values = equity[period_mask]
+        if len(values) < 2 or values[0] == 0:
+            continue
+        rows.append(
+            {
+                "year": int(period.year),
+                "month": int(period.month),
+                "label": str(period),
+                "return_pct": rounded((float(values[-1]) / float(values[0]) - 1) * 100, 2),
+            }
+        )
+    return rows[-144:]
+
+
+def annual_return_report(monthly_returns: list[dict]) -> list[dict]:
+    if not monthly_returns:
+        return []
+
+    rows: list[dict] = []
+    by_year: dict[int, list[float]] = {}
+    for row in monthly_returns:
+        value = row.get("return_pct")
+        if value is None:
+            continue
+        by_year.setdefault(int(row["year"]), []).append(float(value) / 100)
+
+    for year, returns in sorted(by_year.items()):
+        rows.append(
+            {
+                "year": year,
+                "return_pct": rounded((float(np.prod(1 + np.asarray(returns))) - 1) * 100, 2),
+            }
+        )
+    return rows
+
+
+def trade_pnl_report(trade_data: dict, max_points: int = 120) -> list[dict]:
+    pnls = trade_data["pnl_pct"]
+    if len(pnls) == 0:
+        return []
+
+    start = max(0, len(pnls) - max_points)
+    selected = pnls[start:]
+    cumulative = np.cumsum(np.nan_to_num(selected, nan=0.0, posinf=0.0, neginf=0.0))
+    return [
+        {
+            "trade": int(start + index + 1),
+            "pnl_pct": rounded(float(pnl), 2),
+            "cumulative_pnl_pct": rounded(float(cumulative[index]), 2),
+        }
+        for index, pnl in enumerate(selected)
+    ]
+
+
+def alpha_decay_report(signal: np.ndarray, close: np.ndarray, max_lag: int = MAX_ALPHA_DECAY_LAG) -> dict:
+    length = len(close)
+    if length < 10:
+        return {"half_life_bars": None, "edge_by_lag": []}
+
+    max_lag = int(max(1, min(max_lag, max(1, length // 5))))
+    signal_float = signal.astype(np.float64, copy=False)
+    active = signal_float != 0
+    rows: list[dict] = []
+
+    for lag in range(1, max_lag + 1):
+        entry_prices = close[:-lag]
+        exit_prices = close[lag:]
+        valid = np.isfinite(entry_prices) & np.isfinite(exit_prices) & (entry_prices != 0)
+        forward_returns = np.zeros(len(entry_prices), dtype=np.float64)
+        forward_returns[valid] = exit_prices[valid] / entry_prices[valid] - 1
+        directional_edge = signal_float[:-lag] * forward_returns * 100
+        active_mask = active[:-lag] & np.isfinite(directional_edge)
+
+        if active_mask.sum() == 0:
+            mean_edge = None
+            hit_rate = None
+        else:
+            active_edge = directional_edge[active_mask]
+            mean_edge = float(np.mean(active_edge))
+            hit_rate = float(np.mean(active_edge > 0) * 100)
+
+        ic = safe_correlation(signal_float[:-lag][valid], forward_returns[valid])
+        rows.append(
+            {
+                "lag": lag,
+                "mean_edge_pct": rounded(mean_edge, 5),
+                "hit_rate_pct": rounded(hit_rate, 2),
+                "ic": rounded(ic, 4),
+                "samples": int(active_mask.sum()),
+            }
+        )
+
+    edge_values = np.array(
+        [
+            abs(float(row["mean_edge_pct"]))
+            if row.get("mean_edge_pct") is not None
+            else np.nan
+            for row in rows
+        ],
+        dtype=np.float64,
+    )
+    lags = np.arange(1, len(edge_values) + 1, dtype=np.float64)
+    finite = np.isfinite(edge_values) & (edge_values > 0)
+    half_life = None
+    if finite.any():
+        first_index = int(np.flatnonzero(finite)[0])
+        first_edge = float(edge_values[first_index])
+        below_half = np.flatnonzero(finite & (lags > lags[first_index]) & (edge_values <= first_edge / 2))
+        if len(below_half):
+            half_life = float(lags[int(below_half[0])])
+        elif finite.sum() >= 4:
+            x = lags[finite]
+            y = np.log(edge_values[finite])
+            slope, _ = np.polyfit(x, y, 1)
+            if math.isfinite(float(slope)) and slope < 0:
+                half_life = float(-math.log(2) / slope)
+
+    return {
+        "half_life_bars": rounded(half_life, 2),
+        "edge_by_lag": rows,
+    }
+
+
+def regime_metrics(
+    returns: np.ndarray,
+    strategy_returns: np.ndarray,
+    position: np.ndarray,
+    mask: np.ndarray,
+    periods_per_year: float,
+) -> dict:
+    mask = np.asarray(mask, dtype=bool)
+    if len(mask) != len(strategy_returns) or not mask.any():
+        return {
+            "bars": 0,
+            "return_pct": 0,
+            "sharpe_ratio": None,
+            "hit_rate_pct": 0,
+            "exposure_pct": 0,
+        }
+
+    selected_returns = strategy_returns[mask]
+    std = float(np.std(selected_returns))
+    sharpe = (
+        float(np.mean(selected_returns)) / std * math.sqrt(periods_per_year)
+        if std > 0
+        else None
+    )
+    return {
+        "bars": int(mask.sum()),
+        "return_pct": rounded(compound_return_pct(selected_returns), 2),
+        "sharpe_ratio": rounded(sharpe, 2),
+        "hit_rate_pct": rounded(float(np.mean(selected_returns > 0) * 100), 2),
+        "exposure_pct": rounded(float(np.mean(np.abs(position[mask]) > 0) * 100), 2),
+    }
+
+
+def regime_report(
+    close: np.ndarray,
+    returns: np.ndarray,
+    strategy_returns: np.ndarray,
+    position: np.ndarray,
+    periods_per_year: float,
+) -> list[dict]:
+    length = len(close)
+    if length < 30:
+        return []
+
+    window = min(max(24, int(periods_per_year / 24)), max(24, length // 4))
+    close_series = pd.Series(close)
+    return_series = pd.Series(returns)
+    realized_vol = return_series.rolling(window, min_periods=max(8, window // 3)).std().to_numpy()
+    fast_window = max(4, window // 4)
+    fast_ma = close_series.rolling(fast_window, min_periods=max(3, fast_window // 2)).mean()
+    slow_ma = close_series.rolling(window, min_periods=max(8, window // 3)).mean()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        trend_score = ((fast_ma / slow_ma) - 1).to_numpy()
+
+    rows: list[dict] = []
+    vol_valid = np.isfinite(realized_vol)
+    if vol_valid.sum() >= 10:
+        low, high = np.nanpercentile(realized_vol[vol_valid], [33.333, 66.667])
+        regimes = [
+            ("Low Vol", vol_valid & (realized_vol <= low)),
+            ("Mid Vol", vol_valid & (realized_vol > low) & (realized_vol <= high)),
+            ("High Vol", vol_valid & (realized_vol > high)),
+        ]
+        for name, mask in regimes:
+            rows.append({"regime": name, **regime_metrics(returns, strategy_returns, position, mask, periods_per_year)})
+
+    trend_valid = np.isfinite(trend_score)
+    if trend_valid.sum() >= 10:
+        low, high = np.nanpercentile(trend_score[trend_valid], [33.333, 66.667])
+        regimes = [
+            ("Down Trend", trend_valid & (trend_score <= low)),
+            ("Range", trend_valid & (trend_score > low) & (trend_score <= high)),
+            ("Up Trend", trend_valid & (trend_score > high)),
+        ]
+        for name, mask in regimes:
+            rows.append({"regime": name, **regime_metrics(returns, strategy_returns, position, mask, periods_per_year)})
+
+    return rows
+
+
 def run_backtest(df: pd.DataFrame) -> dict:
     if "signal" not in df.columns:
         raise ValueError("Strategy did not produce a 'signal' column")
@@ -391,6 +779,12 @@ def run_backtest(df: pd.DataFrame) -> dict:
     drawdown_amount = account_equity - peak if len(peak) else np.array([], dtype=np.float64)
     max_drawdown_amount = abs(float(np.nanmin(drawdown_amount))) if len(drawdown_amount) else 0
     max_drawdown_pct = abs(float(np.nanmin(drawdown_pct))) * 100 if len(drawdown_pct) else 0
+    ulcer_index = (
+        math.sqrt(float(np.nanmean(np.square(drawdown_pct * 100))))
+        if len(drawdown_pct)
+        else 0
+    )
+    longest_drawdown_bars = max_consecutive_true(drawdown_pct < 0)
 
     returns_std = float(np.std(strategy_returns))
     sharpe_ratio = (
@@ -408,6 +802,18 @@ def run_backtest(df: pd.DataFrame) -> dict:
 
     trade_data = extract_trade_arrays(close, position)
     trade_summary = summarize_trades(trade_data)
+    trade_pnls = finite_values(trade_data["pnl_pct"])
+    winning_trade_pnls = trade_pnls[trade_pnls > 0]
+    losing_trade_pnls = trade_pnls[trade_pnls < 0]
+    avg_win_pct = float(np.mean(winning_trade_pnls)) if len(winning_trade_pnls) else None
+    avg_loss_pct = float(np.mean(losing_trade_pnls)) if len(losing_trade_pnls) else None
+    payoff_ratio = (
+        abs(avg_win_pct / avg_loss_pct)
+        if avg_win_pct is not None and avg_loss_pct not in (None, 0)
+        else None
+    )
+    consecutive_wins = max_consecutive_true(trade_data["pnl_pct"] > 0)
+    consecutive_losses = max_consecutive_true(trade_data["pnl_pct"] < 0)
 
     buy_hold_return = (
         (last_close / first_close - 1) * 100
@@ -416,18 +822,99 @@ def run_backtest(df: pd.DataFrame) -> dict:
     )
     exposure = float(np.mean(np.abs(position) > 0) * 100) if len(position) else 0
     annual_volatility = returns_std * math.sqrt(periods_per_year) * 100
+    trades_per_year = len(trade_pnls) / years if years > 0 else 0
+
+    benchmark_annual_return_pct = annualized_return_pct(
+        float(benchmark_equity[-1]) if len(benchmark_equity) else INITIAL_CAPITAL,
+        INITIAL_CAPITAL,
+        years,
+    )
+    benchmark_peak = (
+        np.maximum.accumulate(benchmark_equity)
+        if len(benchmark_equity)
+        else np.array([], dtype=np.float64)
+    )
+    with np.errstate(divide="ignore", invalid="ignore"):
+        benchmark_drawdown_pct = np.where(benchmark_peak != 0, benchmark_equity / benchmark_peak - 1, 0)
+    benchmark_max_drawdown_pct = (
+        abs(float(np.nanmin(benchmark_drawdown_pct))) * 100
+        if len(benchmark_drawdown_pct)
+        else 0
+    )
+
+    finite_strategy_returns = finite_values(strategy_returns)
+    var_95_raw = safe_percentile(strategy_returns, 5)
+    var_99_raw = safe_percentile(strategy_returns, 1)
+    expected_shortfall_95 = None
+    expected_shortfall_99 = None
+    if var_95_raw is not None:
+        tail = finite_strategy_returns[finite_strategy_returns <= var_95_raw]
+        expected_shortfall_95 = -float(np.mean(tail)) * 100 if len(tail) else None
+    if var_99_raw is not None:
+        tail = finite_strategy_returns[finite_strategy_returns <= var_99_raw]
+        expected_shortfall_99 = -float(np.mean(tail)) * 100 if len(tail) else None
+
+    return_series = pd.Series(finite_strategy_returns)
+    skewness = float(return_series.skew()) if len(return_series) >= 3 else None
+    kurtosis = float(return_series.kurt()) if len(return_series) >= 4 else None
+    p95 = safe_percentile(strategy_returns, 95)
+    p5 = safe_percentile(strategy_returns, 5)
+    tail_ratio = (
+        abs(p95 / p5)
+        if p95 is not None and p5 not in (None, 0)
+        else None
+    )
+    gross_positive_returns = float(np.sum(strategy_returns[strategy_returns > 0]))
+    gross_negative_returns = abs(float(np.sum(strategy_returns[strategy_returns < 0])))
+    omega_ratio = (
+        gross_positive_returns / gross_negative_returns
+        if gross_negative_returns > 0
+        else None
+    )
+
+    correlation_to_benchmark = safe_correlation(strategy_returns, returns)
+    benchmark_variance = float(np.var(returns))
+    beta_to_benchmark = (
+        float(np.cov(strategy_returns, returns)[0, 1] / benchmark_variance)
+        if len(strategy_returns) >= 2 and benchmark_variance > 0
+        else None
+    )
+    alpha_annual_pct = (
+        (float(np.mean(strategy_returns)) - beta_to_benchmark * float(np.mean(returns)))
+        * periods_per_year
+        * 100
+        if beta_to_benchmark is not None
+        else None
+    )
+    excess_returns = strategy_returns - returns
+    tracking_error_pct = float(np.std(excess_returns)) * math.sqrt(periods_per_year) * 100
+    information_ratio = (
+        float(np.mean(excess_returns)) / float(np.std(excess_returns)) * math.sqrt(periods_per_year)
+        if float(np.std(excess_returns)) > 0
+        else None
+    )
 
     chart_indices = downsample_indices(length)
     timestamps = format_labels(df, chart_indices, seconds)
     chart_step = max(1, math.ceil(length / max(1, len(chart_indices)))) if length else 1
+    rolling_research = rolling_research_series(strategy_returns, chart_indices, periods_per_year)
+    monthly_returns = monthly_return_report(seconds, account_equity)
+    alpha_decay = alpha_decay_report(signal, close)
 
     return {
         "initial_capital": INITIAL_CAPITAL,
         "risk_percent": RISK_FRACTION * 100,
+        "close": rounded_list(close[chart_indices], 4),
+        "position": [int(value) for value in position[chart_indices]],
+        "signal": [int(value) for value in signal[chart_indices]],
         "equity": rounded_list(account_equity[chart_indices], 2),
         "equity_pct": rounded_list((equity_multiplier[chart_indices] - 1) * 100, 4),
         "benchmark_equity": rounded_list(benchmark_equity[chart_indices], 2),
         "benchmark_pct": rounded_list((benchmark_multiplier[chart_indices] - 1) * 100, 4),
+        "strategy_returns_pct": rounded_list(strategy_returns[chart_indices] * 100, 5),
+        "benchmark_returns_pct": rounded_list(returns[chart_indices] * 100, 5),
+        "drawdown_pct_series": rounded_list(drawdown_pct[chart_indices] * 100, 4),
+        "benchmark_drawdown_pct_series": rounded_list(benchmark_drawdown_pct[chart_indices] * 100, 4),
         "timestamps": timestamps,
         "chart_points": int(len(chart_indices)),
         "chart_sample_step": int(chart_step),
@@ -444,12 +931,47 @@ def run_backtest(df: pd.DataFrame) -> dict:
         "relative_drawdown_pct": rounded(max_drawdown_amount / INITIAL_CAPITAL * 100),
         "sharpe_ratio": rounded(sharpe_ratio),
         "sortino_ratio": rounded(sortino_ratio),
+        "recovery_factor": rounded(total_return_pct / max_drawdown_pct if max_drawdown_pct > 0 else None),
+        "calmar_ratio": rounded(annual_return_pct / max_drawdown_pct if max_drawdown_pct > 0 else None),
         "annual_volatility_pct": rounded(annual_volatility),
+        "ulcer_index": rounded(ulcer_index),
+        "longest_drawdown_bars": int(longest_drawdown_bars),
         "buy_hold_return_pct": rounded(buy_hold_return),
+        "benchmark_annual_return_pct": rounded(benchmark_annual_return_pct),
+        "benchmark_max_drawdown_pct": rounded(benchmark_max_drawdown_pct),
+        "excess_return_pct": rounded(total_return_pct - buy_hold_return),
+        "alpha_annual_pct": rounded(alpha_annual_pct),
+        "beta_to_benchmark": rounded(beta_to_benchmark),
+        "correlation_to_benchmark": rounded(correlation_to_benchmark),
+        "tracking_error_pct": rounded(tracking_error_pct),
+        "information_ratio": rounded(information_ratio),
+        "value_at_risk_95_pct": rounded(-var_95_raw * 100 if var_95_raw is not None else None),
+        "value_at_risk_99_pct": rounded(-var_99_raw * 100 if var_99_raw is not None else None),
+        "expected_shortfall_95_pct": rounded(expected_shortfall_95),
+        "expected_shortfall_99_pct": rounded(expected_shortfall_99),
+        "skewness": rounded(skewness),
+        "kurtosis": rounded(kurtosis),
+        "tail_ratio": rounded(tail_ratio),
+        "omega_ratio": rounded(omega_ratio),
         "exposure_pct": rounded(exposure),
+        "trades_per_year": rounded(trades_per_year),
+        "avg_win_pct": rounded(avg_win_pct),
+        "avg_loss_pct": rounded(avg_loss_pct),
+        "payoff_ratio": rounded(payoff_ratio),
+        "max_consecutive_wins": int(consecutive_wins),
+        "max_consecutive_losses": int(consecutive_losses),
+        "alpha_decay_half_life_bars": alpha_decay["half_life_bars"],
+        "alpha_decay": alpha_decay,
+        "return_distribution": return_distribution(strategy_returns),
+        "monthly_returns": monthly_returns,
+        "annual_returns": annual_return_report(monthly_returns),
+        "validation_folds": validation_fold_report(strategy_returns, periods_per_year),
+        "regime_breakdown": regime_report(close, returns, strategy_returns, position, periods_per_year),
+        "trade_pnl_series": trade_pnl_report(trade_data),
         "num_bars": length,
         "periods_per_year": rounded(periods_per_year, 1),
         "years": rounded(years, 2),
         "trades": build_trade_rows(df, close, seconds, trade_data),
+        **rolling_research,
         **trade_summary,
     }
