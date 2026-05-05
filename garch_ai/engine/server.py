@@ -842,7 +842,7 @@ def default_param_ranges(params: dict, schema: list[dict] | None = None) -> dict
 
 def sanitize_param_ranges(params: dict, requested_ranges: dict | None, max_runs: int) -> tuple[dict, int]:
     schema = build_param_schema(params)
-    ranges = default_param_ranges(params, schema)
+    ranges: dict = {}
     requested_ranges = requested_ranges or {}
 
     for name, values in requested_ranges.items():
@@ -867,6 +867,9 @@ def sanitize_param_ranges(params: dict, requested_ranges: dict | None, max_runs:
         cleaned = sorted(set(cleaned))
         if cleaned:
             ranges[str(name)] = cleaned
+
+    if not ranges:
+        ranges = default_param_ranges(params, schema)
 
     capped_runs = max(1, min(int(max_runs or MAX_OPTIMIZATION_RUNS), MAX_OPTIMIZATION_RUNS))
     total = 1
@@ -1068,6 +1071,7 @@ def backtest_prepared_code(prompt: str, code: str, market_df: pd.DataFrame, para
     summary = heuristic_strategy_summary(prompt, compiled)
     extracted_params = require_strategy_params(compiled)
     active_params = {**extracted_params, **(coerce_param_overrides(extracted_params, params) or {})}
+    summaries = build_backtest_summaries(result)
     return {
         **result,
         "code": compiled,
@@ -1075,6 +1079,7 @@ def backtest_prepared_code(prompt: str, code: str, market_df: pd.DataFrame, para
         "active_params": active_params,
         "param_schema": build_param_schema(extracted_params),
         "summary": summary,
+        **summaries,
         "attempts": 1,
         "strategy_seconds": round(strategy_seconds, 3),
     }
@@ -1154,6 +1159,116 @@ def compact_metrics(result: dict, metric: str) -> dict:
     }
 
 
+def format_pct(value, digits: int = 2) -> str:
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return "-"
+    prefix = "+" if float(value) > 0 else ""
+    return f"{prefix}{float(value):.{digits}f}%"
+
+
+def format_num(value, digits: int = 2) -> str:
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return "-"
+    return f"{float(value):.{digits}f}"
+
+
+def best_and_worst_folds(folds: list[dict]) -> tuple[dict | None, dict | None]:
+    valid = [
+        fold
+        for fold in folds
+        if isinstance(fold.get("return_pct"), (int, float))
+        and math.isfinite(float(fold["return_pct"]))
+    ]
+    if not valid:
+        return None, None
+    return max(valid, key=lambda fold: float(fold["return_pct"])), min(
+        valid,
+        key=lambda fold: float(fold["return_pct"]),
+    )
+
+
+def build_backtest_summaries(result: dict) -> dict:
+    total_return = result.get("total_return_pct")
+    sharpe = result.get("sharpe_ratio")
+    max_drawdown = result.get("max_drawdown_pct")
+    win_rate = result.get("win_rate")
+    trades = result.get("trades_total")
+    exposure = result.get("exposure_pct")
+    half_life = result.get("alpha_decay_half_life_bars")
+    buy_hold = result.get("buy_hold_return_pct")
+    excess = result.get("excess_return_pct")
+    folds = result.get("validation_folds") or []
+    best_fold, worst_fold = best_and_worst_folds(folds)
+    monthly_returns = result.get("monthly_returns") or []
+    positive_months = [
+        row
+        for row in monthly_returns
+        if isinstance(row.get("return_pct"), (int, float)) and row["return_pct"] > 0
+    ]
+
+    headline = (
+        f"Backtest: {format_pct(total_return)} total, Sharpe {format_num(sharpe)}, "
+        f"max DD {format_pct(max_drawdown)} bei {format_pct(exposure)} Exposure."
+    )
+    bullets = [
+        (
+            f"Benchmark-Vergleich: Buy-and-hold {format_pct(buy_hold)}, "
+            f"Excess Return {format_pct(excess)}."
+        ),
+        (
+            f"Trades: {trades if trades is not None else '-'} Trades, "
+            f"Winrate {format_pct(win_rate)}, Profit Factor {format_num(result.get('profit_factor'))}."
+        ),
+        (
+            f"Tail Risk: VaR 95 {format_pct(result.get('value_at_risk_95_pct'))}, "
+            f"Expected Shortfall 95 {format_pct(result.get('expected_shortfall_95_pct'))}."
+        ),
+    ]
+    if half_life is not None:
+        bullets.append(f"Alpha Decay: geschaetzte Halbwertszeit {format_num(half_life)} Bars.")
+    if best_fold and worst_fold:
+        bullets.append(
+            "Walk-forward Folds: bester Fold "
+            f"{best_fold.get('fold')} mit {format_pct(best_fold.get('return_pct'))}, "
+            f"schlechtester Fold {worst_fold.get('fold')} mit {format_pct(worst_fold.get('return_pct'))}."
+        )
+
+    chart_summary = {
+        "equity": (
+            f"Equity-Chart zeigt Strategy {format_pct(total_return)} vs Benchmark {format_pct(buy_hold)}; "
+            f"der Abstand liegt bei {format_pct(excess)}."
+        ),
+        "drawdown": (
+            f"Drawdown-Chart markiert max DD {format_pct(max_drawdown)} "
+            f"und {result.get('longest_drawdown_bars', '-')} Bars laengste Drawdown-Phase."
+        ),
+        "rolling": (
+            f"Rolling-Quality nutzt ein Fenster von {result.get('rolling_window', '-')} Bars "
+            "fuer Sharpe, Volatilitaet und Winrate."
+        ),
+        "distribution": (
+            f"Return-Distribution zeigt Skew {format_num(result.get('skewness'))}, "
+            f"Kurtosis {format_num(result.get('kurtosis'))}, Tail Ratio {format_num(result.get('tail_ratio'))}."
+        ),
+        "alpha_decay": (
+            "Alpha-Decay-Chart zeigt Forward Edge je Lag; "
+            f"Halbwertszeit {format_num(half_life)} Bars."
+        ),
+        "monthly": (
+            f"Monthly-Heatmap: {len(positive_months)}/{len(monthly_returns)} Monate positiv."
+            if monthly_returns
+            else "Monthly-Heatmap hat noch nicht genug Monatsdaten."
+        ),
+    }
+    return {
+        "analysis_summary": {
+            "headline": headline,
+            "bullets": bullets,
+        },
+        "chart_summary": chart_summary,
+    }
+
+
 def build_optimization_rows(
     compiled_code: str,
     prompt: str,
@@ -1161,7 +1276,7 @@ def build_optimization_rows(
     base_params: dict,
     ranges: dict,
     metric: str,
-) -> list[dict]:
+) -> tuple[list[dict], dict]:
     from itertools import product
 
     keys = list(ranges.keys())
@@ -1171,6 +1286,8 @@ def build_optimization_rows(
         values_grid = product(*(ranges[key] for key in keys))
 
     rows: list[dict] = []
+    best_result: dict | None = None
+    best_score = -float("inf")
     for values in values_grid:
         params = {**base_params, **dict(zip(keys, values))}
         try:
@@ -1178,17 +1295,23 @@ def build_optimization_rows(
         except Exception as exc:
             logger.warning("Optimization point failed for %s: %s", params, exc)
             continue
+        metric_value = selected_metric(result, metric)
+        compact = compact_metrics(result, metric)
         rows.append(
             {
                 "params": params,
-                "metric_value": selected_metric(result, metric),
-                "metrics": result,
-                "compact": compact_metrics(result, metric),
+                "metric_value": metric_value,
+                "compact": compact,
                 "folds": result.get("validation_folds", []),
             }
         )
+        if metric_value > best_score:
+            best_score = metric_value
+            best_result = result
     rows.sort(key=lambda row: row["metric_value"], reverse=True)
-    return rows
+    if best_result is None:
+        best_result = {}
+    return rows, best_result
 
 
 def optimization_leaderboard(rows: list[dict], metric: str, limit: int = 20) -> list[dict]:
@@ -1196,7 +1319,7 @@ def optimization_leaderboard(rows: list[dict], metric: str, limit: int = 20) -> 
         {
             "rank": index + 1,
             "params": row["params"],
-            **compact_metrics(row["metrics"], metric),
+            **row["compact"],
         }
         for index, row in enumerate(rows[:limit])
     ]
@@ -1216,7 +1339,7 @@ def optimization_surface(rows: list[dict], ranges: dict, metric: str) -> dict:
             {
                 "x": params.get(x_param),
                 "y": params.get(y_param) if y_param else 0,
-                "z": round(selected_metric(row["metrics"], metric), 4),
+                "z": round(float(row["metric_value"]), 4),
                 "params": params,
             }
         )
@@ -1229,7 +1352,7 @@ def parameter_sensitivity(rows: list[dict], ranges: dict, metric: str) -> list[d
         buckets = []
         for value in values:
             metric_values = [
-                selected_metric(row["metrics"], metric)
+                row["metric_value"]
                 for row in rows
                 if row["params"].get(key) == value
             ]
@@ -1265,20 +1388,20 @@ def stability_report(rows: list[dict], metric: str) -> dict:
         return {}
 
     metric_values = np.array(
-        [selected_metric(row["metrics"], metric) for row in rows],
+        [row["metric_value"] for row in rows],
         dtype=np.float64,
     )
     finite_metric = metric_values[np.isfinite(metric_values)]
     returns = np.array(
         [
-            float(row["metrics"].get("total_return_pct") or 0)
+            float(row["compact"].get("total_return_pct") or 0)
             for row in rows
         ],
         dtype=np.float64,
     )
     sharpes = np.array(
         [
-            float(row["metrics"].get("sharpe_ratio") or 0)
+            float(row["compact"].get("sharpe_ratio") or 0)
             for row in rows
         ],
         dtype=np.float64,
@@ -1399,6 +1522,81 @@ def estimate_pbo(rows: list[dict], metric: str) -> dict:
     }
 
 
+def format_param_dict(params: dict, limit: int = 6) -> str:
+    items = list(params.items())[:limit]
+    suffix = ", ..." if len(params) > limit else ""
+    return ", ".join(f"{key}={value}" for key, value in items) + suffix
+
+
+def build_research_summary(
+    rows: list[dict],
+    ranges: dict,
+    metric: str,
+    best_params: dict,
+    best_metrics: dict,
+    stability: dict,
+    pbo: dict,
+    elapsed: float,
+) -> dict:
+    best_value = selected_metric(best_metrics, metric)
+    pbo_text = (
+        f"PBO {format_pct(pbo.get('pbo_probability_pct'))}, median OOS rank "
+        f"{format_pct(pbo.get('median_oos_rank_pct'))}."
+        if pbo.get("available")
+        else f"PBO nicht verfuegbar: {pbo.get('reason', 'zu wenige valide Splits')}."
+    )
+    planned_runs = 1
+    for values in ranges.values():
+        planned_runs *= max(1, len(values))
+    headline = (
+        f"Optimization: {len(rows)} valide Runs, best {metric}={format_num(best_value, 4)} "
+        f"mit {format_param_dict(best_params)}."
+    )
+    bullets = [
+        (
+            f"Grid: {len(ranges)} Parameter aktiv, geplant {planned_runs} Kombinationen, "
+            f"Laufzeit {format_num(elapsed)}s."
+        ),
+        (
+            f"Stabilitaet: Median {metric}={format_num(stability.get('median_metric'), 4)}, "
+            f"IQR {format_num(stability.get('iqr'), 4)}, positive Sharpe Rate "
+            f"{format_pct(stability.get('positive_sharpe_rate_pct'))}."
+        ),
+        pbo_text,
+        (
+            f"Best Backtest: Return {format_pct(best_metrics.get('total_return_pct'))}, "
+            f"Sharpe {format_num(best_metrics.get('sharpe_ratio'))}, "
+            f"Max DD {format_pct(best_metrics.get('max_drawdown_pct'))}."
+        ),
+    ]
+    chart_summary = {
+        "surface": (
+            "Optimization Surface zeigt die Metric-Landschaft fuer die ersten zwei "
+            "variierten Parameter; flache Plateaus sind robuster als isolierte Peaks."
+        ),
+        "pbo": (
+            "PBO-Chart zeigt, wie oft der in-sample beste Kandidat out-of-sample im "
+            "unteren Rangbereich landet."
+        ),
+        "leaderboard": (
+            "Leaderboard zeigt kompakte Kennzahlen je Parametersatz; die beste Zeile "
+            "liefert die Chartdaten im Performance-Tab."
+        ),
+        "sensitivity": (
+            "Sensitivity zeigt, welche Parameterwerte die Zielmetric im Mittel treiben."
+        ),
+        "folds": (
+            "Validation Folds zeigen chronologische Stabilitaet statt nur einen "
+            "einzigen Gesamtbacktest."
+        ),
+    }
+    return {
+        "headline": headline,
+        "bullets": bullets,
+        "chart_summary": chart_summary,
+    }
+
+
 def run_parameter_research(
     prompt: str,
     code: str,
@@ -1413,12 +1611,40 @@ def run_parameter_research(
     active_params = {**base_params, **(coerce_param_overrides(base_params, params) or {})}
     ranges, planned_runs = sanitize_param_ranges(active_params, param_ranges, max_runs)
     started = time.perf_counter()
-    rows = build_optimization_rows(compiled, prompt, market_df, active_params, ranges, metric)
+    rows, best_metrics = build_optimization_rows(
+        compiled,
+        prompt,
+        market_df,
+        active_params,
+        ranges,
+        metric,
+    )
     elapsed = time.perf_counter() - started
     if not rows:
         raise ValueError("No optimization candidate produced a valid backtest.")
 
     best = rows[0]
+    best_metrics = {
+        **best_metrics,
+        "code": compiled,
+        "params": base_params,
+        "active_params": best["params"],
+        "param_schema": build_param_schema(base_params),
+        "summary": heuristic_strategy_summary(prompt, compiled),
+    }
+    best_metrics.update(build_backtest_summaries(best_metrics))
+    stability = stability_report(rows, metric)
+    pbo = estimate_pbo(rows, metric)
+    research_summary = build_research_summary(
+        rows=rows,
+        ranges=ranges,
+        metric=metric,
+        best_params=best["params"],
+        best_metrics=best_metrics,
+        stability=stability,
+        pbo=pbo,
+        elapsed=elapsed,
+    )
     return {
         "code": compiled,
         "base_params": base_params,
@@ -1431,20 +1657,14 @@ def run_parameter_research(
         "best": {
             "params": best["params"],
             "metric_value": round(float(best["metric_value"]), 4),
-            "metrics": {
-                **best["metrics"],
-                "code": compiled,
-                "params": base_params,
-                "active_params": best["params"],
-                "param_schema": build_param_schema(base_params),
-                "summary": heuristic_strategy_summary(prompt, compiled),
-            },
+            "metrics": best_metrics,
         },
         "leaderboard": optimization_leaderboard(rows, metric),
         "surface": optimization_surface(rows, ranges, metric),
         "sensitivity": parameter_sensitivity(rows, ranges, metric),
-        "stability": stability_report(rows, metric),
-        "pbo": estimate_pbo(rows, metric),
+        "stability": stability,
+        "pbo": pbo,
+        "research_summary": research_summary,
         "research_seconds": round(elapsed, 3),
     }
 

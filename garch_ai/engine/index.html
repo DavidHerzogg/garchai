@@ -507,6 +507,40 @@
       margin: 0;
     }
 
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .summary-card {
+      min-width: 0;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px;
+    }
+
+    .summary-card strong {
+      display: block;
+      margin-bottom: 8px;
+      font-size: 13px;
+    }
+
+    .summary-card ul {
+      display: grid;
+      gap: 7px;
+      margin: 0;
+      padding-left: 17px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .summary-card li {
+      padding-left: 2px;
+    }
+
     .code-block {
       margin: 0;
       padding: 14px;
@@ -616,6 +650,10 @@
 
       .research-grid {
         grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .summary-grid {
+        grid-template-columns: 1fr;
       }
     }
 
@@ -867,6 +905,20 @@
         scroll-snap-align: start;
       }
 
+      .summary-grid {
+        gap: 10px;
+      }
+
+      .summary-card {
+        border-radius: 10px;
+        padding: 11px;
+      }
+
+      .summary-card ul {
+        font-size: 13px;
+        line-height: 1.42;
+      }
+
       .table-panel {
         max-height: 340px;
         margin: 0 -2px;
@@ -1047,6 +1099,21 @@
         </nav>
 
         <section id="tab-performance" class="tab-pane active">
+          <div class="summary-grid">
+            <div class="summary-card">
+              <div class="chart-title">Backtest Summary</div>
+              <strong id="analysisHeadline">No backtest yet.</strong>
+              <ul id="analysisBullets">
+                <li>Generate a strategy to see the research summary.</li>
+              </ul>
+            </div>
+            <div class="summary-card">
+              <div class="chart-title">Chart Summary</div>
+              <ul id="chartBullets">
+                <li>Charts will be summarized after a run.</li>
+              </ul>
+            </div>
+          </div>
           <div class="chart-grid">
             <div class="chart-panel full">
               <div class="chart-title"><span>Equity vs Benchmark</span><span id="sampleInfo"></span></div>
@@ -1078,6 +1145,21 @@
         </section>
 
         <section id="tab-robustness" class="tab-pane">
+          <div class="summary-grid">
+            <div class="summary-card">
+              <div class="chart-title">Research Summary</div>
+              <strong id="researchHeadline">No optimization yet.</strong>
+              <ul id="researchBullets">
+                <li>Run Optimize + PBO Research to test robustness.</li>
+              </ul>
+            </div>
+            <div class="summary-card">
+              <div class="chart-title">Robustness Charts</div>
+              <ul id="researchChartBullets">
+                <li>Surface, PBO, sensitivity and folds will be summarized here.</li>
+              </ul>
+            </div>
+          </div>
           <div id="researchSummary" class="research-grid"></div>
           <div class="chart-grid">
             <div class="chart-panel">
@@ -1507,6 +1589,25 @@
       renderPerformanceCharts(data);
       renderHeatmap(data.monthly_returns || []);
       renderTables(data);
+      renderBacktestSummaries(data);
+    }
+
+    function listItems(values) {
+      const rows = Array.isArray(values) ? values.filter(Boolean) : [];
+      if (!rows.length) return "<li>No summary available.</li>";
+      return rows.map((value) => `<li>${escapeHtml(value)}</li>`).join("");
+    }
+
+    function chartSummaryItems(summary) {
+      if (!summary || typeof summary !== "object") return [];
+      return Object.entries(summary).map(([key, value]) => `${key.replaceAll("_", " ")}: ${value}`);
+    }
+
+    function renderBacktestSummaries(data) {
+      const summary = data.analysis_summary || {};
+      byId("analysisHeadline").textContent = summary.headline || data.summary || "Backtest complete.";
+      byId("analysisBullets").innerHTML = listItems(summary.bullets || []);
+      byId("chartBullets").innerHTML = listItems(chartSummaryItems(data.chart_summary || {}));
     }
 
     function renderMetrics(data) {
@@ -1706,6 +1807,10 @@
       if (!research) return;
       const pbo = research.pbo || {};
       const stability = research.stability || {};
+      const narrative = research.research_summary || {};
+      byId("researchHeadline").textContent = narrative.headline || "Optimization complete.";
+      byId("researchBullets").innerHTML = listItems(narrative.bullets || []);
+      byId("researchChartBullets").innerHTML = listItems(chartSummaryItems(narrative.chart_summary || {}));
       const cards = [
         ["Runs", research.completed_runs, "Completed"],
         ["Best Metric", research.best?.metric_value, research.metric],
